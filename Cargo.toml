@@ -1,0 +1,55 @@
+[package]
+name = "netwatch"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "Per-application network monitor for Windows: which app talked to whom, when, how much — and what it said when the protocol is plaintext."
+publish = false
+
+[[bin]]
+name = "packetscope"
+path = "src/main.rs"
+
+[features]
+default = ["npcap"]
+# Packet capture through Npcap (libpcap API). Needs the Npcap SDK at build
+# time and Npcap installed at run time. Without it the app still runs in
+# connection-table mode (endpoints per app, no byte counts or payloads).
+npcap = ["dep:pcap"]
+
+[dependencies]
+iced = { version = "0.13", features = ["tokio", "image", "canvas"] }
+etherparse = "0.16"
+pcap = { version = "2", optional = true }
+
+png = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_Com",
+    "Win32_System_ProcessStatus",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+lto = "thin"
+strip = true
