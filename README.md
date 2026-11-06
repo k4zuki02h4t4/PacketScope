@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/app-icon.png" alt="PacketScope" width="128" height="128">
+  <img src="screenshot.png" alt="PacketScope" width="100%" height="auto">
 </p>
 
 # PacketScope
