@@ -3,7 +3,8 @@
 
 use crate::attrib::{Resolver, TableResolver};
 use crate::model::*;
-use crate::parse::{classify, is_client_hello, parse_frame, tls_server_version};
+use crate::parse::{classify, classify_decrypted, is_client_hello, parse_frame, tls_server_version};
+use crate::tls::{KeyLog, TcpStream};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::mpsc::Receiver;
@@ -20,6 +21,11 @@ pub struct Engine {
     seen_processes: HashSet<String>,
     seen_destinations: HashSet<(String, String)>, // (process, host-or-ip)
     upload_windows: HashMap<String, VecDeque<(SystemTime, u64)>>, // per process
+    /// Reassembled streams for TLS flows (kept engine-side: snapshots stay
+    /// light) plus the sizes/keys state at the last decryption attempt.
+    tls_streams: HashMap<FlowKey, (TcpStream, TcpStream, (usize, usize, usize))>,
+    keylog: KeyLog,
+    last_keylog_check: SystemTime,
     last_resolve: SystemTime,
     max_flows: usize,
 }
@@ -51,6 +57,9 @@ impl Engine {
             seen_processes: HashSet::new(),
             seen_destinations: HashSet::new(),
             upload_windows: HashMap::new(),
+            tls_streams: HashMap::new(),
+            keylog: KeyLog::new(),
+            last_keylog_check: SystemTime::UNIX_EPOCH,
             last_resolve: SystemTime::UNIX_EPOCH,
             max_flows: 5000,
         }
@@ -111,6 +120,7 @@ impl Engine {
     }
 
     fn on_tick(&mut self) {
+        self.try_keylog_decrypt();
         if self.last_resolve.elapsed().unwrap_or_default() > Duration::from_secs(1) {
             self.resolver.refresh();
             self.last_resolve = SystemTime::now();
@@ -153,6 +163,7 @@ impl Engine {
         if is_new && self.flows.len() >= self.max_flows {
             if let Some(old) = self.order.pop_front() {
                 self.flows.remove(&old);
+                self.tls_streams.remove(&old);
             }
         }
         let flow = self.flows.entry(key.clone()).or_insert_with(|| {
@@ -176,6 +187,23 @@ impl Engine {
             }
             if matches!(flow.content_down, Content::Unknown) {
                 flow.content_down = classify(&p.payload, p.src_port, p.dst_port, p.proto);
+            }
+        }
+        // Keep the reassembled streams of TLS flows for key-log decryption.
+        if p.proto == Proto::Tcp {
+            let has_stream = self.tls_streams.contains_key(&key);
+            if has_stream {
+                if let Some((up_s, down_s, _)) = self.tls_streams.get_mut(&key) {
+                    if upload {
+                        up_s.push(p.seq.unwrap_or(0), &p.payload);
+                    } else {
+                        down_s.push(p.seq.unwrap_or(0), &p.payload);
+                    }
+                }
+            } else if upload && is_client_hello(&p.payload) && self.tls_streams.len() < 2000 {
+                let mut up_s = TcpStream::new();
+                up_s.push(p.seq.unwrap_or(0), &p.payload);
+                self.tls_streams.insert(key.clone(), (up_s, TcpStream::new(), (0, 0, 0)));
             }
         }
         // TLS version from the ServerHello when one passes by.
@@ -218,6 +246,50 @@ impl Engine {
         drop(flow);
         if !pname.is_empty() && !self.settings.is_excluded(&pname, &ppath) {
             self.alert_checks(&pname, &host_label, upload, len, now);
+        }
+    }
+
+    /// Refresh the key log and decrypt any TLS flow whose streams or the
+    /// available secrets changed since the last attempt.
+    fn try_keylog_decrypt(&mut self) {
+        if self.last_keylog_check.elapsed().unwrap_or_default() > Duration::from_secs(2) {
+            self.last_keylog_check = SystemTime::now();
+            self.keylog.refresh(&keylog_path(&self.settings));
+        }
+        if self.keylog.entries() == 0 {
+            return;
+        }
+        let entries = self.keylog.entries();
+        let keys: Vec<FlowKey> = self.tls_streams.keys().cloned().collect();
+        for k in keys {
+            let already = self.flows.get(&k).map(|f| f.tls_decrypted).unwrap_or(false);
+            if already {
+                continue;
+            }
+            let Some((up_s, down_s, seen)) = self.tls_streams.get_mut(&k) else {
+                continue;
+            };
+            let state = (up_s.len(), down_s.len(), entries);
+            if *seen == state || up_s.len() == 0 || down_s.len() == 0 {
+                continue;
+            }
+            *seen = state;
+            let up = up_s.bytes().to_vec();
+            let down = down_s.bytes().to_vec();
+            let Some(dec) = crate::tls::try_decrypt(&up, &down, &self.keylog) else {
+                continue;
+            };
+            if let Some(flow) = self.flows.get_mut(&k) {
+                flow.tls_decrypted = true;
+                if !dec.up.is_empty() {
+                    flow.content_up = classify_decrypted(&dec.up);
+                    flow.plain_up = dec.up;
+                }
+                if !dec.down.is_empty() {
+                    flow.content_down = classify_decrypted(&dec.down);
+                    flow.plain_down = dec.down;
+                }
+            }
         }
     }
 
@@ -299,6 +371,47 @@ impl Engine {
             self.alerts.iter().cloned().collect(),
             self.capture_status.clone(),
         )
+    }
+}
+
+/// Where the browser key log lives: settings override, else
+/// `sslkeylog.log` in the same data directory as settings.txt.
+pub fn keylog_path(settings: &Settings) -> std::path::PathBuf {
+    if let Some(p) = &settings.keylog_path {
+        if !p.trim().is_empty() {
+            return std::path::PathBuf::from(p.trim());
+        }
+    }
+    data_dir().join("sslkeylog.log")
+}
+
+fn data_dir() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        base.join("PacketScope")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+        home.join("Library").join("Application Support").join("PacketScope")
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".config"))
+                    .unwrap_or_default()
+            });
+        base.join("PacketScope")
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        std::path::PathBuf::from("PacketScope")
     }
 }
 

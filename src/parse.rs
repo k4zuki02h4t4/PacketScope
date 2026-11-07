@@ -15,6 +15,8 @@ pub struct Parsed {
     pub dst_port: u16,
     pub proto: Proto,
     pub payload: Vec<u8>,
+    /// TCP sequence number of the first payload byte (None unless TCP).
+    pub seq: Option<u32>,
 }
 
 /// Parse one captured frame. `linktype` is the pcap datalink type:
@@ -59,6 +61,7 @@ fn parse_ethernet(frame: &[u8]) -> Option<Parsed> {
             dst_port: 0,
             proto: Proto::Ether(0x0806),
             payload: frame[14..].to_vec(),
+            seq: None,
         });
     }
     let headers = LaxPacketHeaders::from_ethernet(frame).ok()?;
@@ -79,10 +82,12 @@ fn finish(headers: LaxPacketHeaders<'_>) -> Option<Parsed> {
             h.next_header.0,
         ),
     };
-    let (proto, src_port, dst_port) = match headers.transport {
-        Some(TransportHeader::Tcp(h)) => (Proto::Tcp, h.source_port, h.destination_port),
-        Some(TransportHeader::Udp(h)) => (Proto::Udp, h.source_port, h.destination_port),
-        _ => (Proto::IpOther(ip_proto), 0, 0),
+    let (proto, src_port, dst_port, seq) = match headers.transport {
+        Some(TransportHeader::Tcp(h)) => {
+            (Proto::Tcp, h.source_port, h.destination_port, Some(h.sequence_number))
+        }
+        Some(TransportHeader::Udp(h)) => (Proto::Udp, h.source_port, h.destination_port, None),
+        _ => (Proto::IpOther(ip_proto), 0, 0, None),
     };
     Some(Parsed {
         src_ip,
@@ -91,6 +96,7 @@ fn finish(headers: LaxPacketHeaders<'_>) -> Option<Parsed> {
         dst_port,
         proto,
         payload: headers.payload.slice().to_vec(),
+        seq,
     })
 }
 
@@ -352,4 +358,48 @@ pub fn tls_server_version(p: &[u8]) -> Option<String> {
 /// True when the payload starts a TLS ClientHello.
 pub fn is_client_hello(p: &[u8]) -> bool {
     p.len() >= 6 && p[0] == 0x16 && p[5] == 0x01
+}
+
+/// Classify bytes recovered by TLS decryption (the payload the app itself
+/// saw). HTTP/1 answers reuse the normal headline parser; HTTP/2 is binary,
+/// so DATA frame payloads are extracted as the readable part.
+pub fn classify_decrypted(p: &[u8]) -> Content {
+    if p.is_empty() {
+        return Content::Unknown;
+    }
+    if let Some(http) = http_headline(p) {
+        return http;
+    }
+    if p.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") {
+        let mut data = Vec::new();
+        let mut off = 24usize;
+        while off + 9 <= p.len() {
+            let len = ((p[off] as usize) << 16) | ((p[off + 1] as usize) << 8) | p[off + 2] as usize;
+            let ftype = p[off + 3];
+            let flags = p[off + 4];
+            let body = &p[off + 9..(off + 9 + len).min(p.len())];
+            if ftype == 0 {
+                // DATA: strip padding when PADDED (0x8) is set.
+                if flags & 0x8 != 0 && !body.is_empty() {
+                    let pad = body[0] as usize;
+                    let end = body.len().saturating_sub(pad);
+                    if end >= 1 {
+                        data.extend_from_slice(&body[1..end]);
+                    }
+                } else {
+                    data.extend_from_slice(body);
+                }
+            }
+            off += 9 + len;
+        }
+        if data.is_empty() {
+            return Content::Plain {
+                preview: "HTTP/2 ストリーム（DATA フレームはまだありません。ヘッダーは HPACK 圧縮のため表示できません）".to_string(),
+            };
+        }
+        return Content::Plain {
+            preview: format!("HTTP/2 DATA フレームの内容:\n{}", preview_text(&data)),
+        };
+    }
+    Content::Plain { preview: preview_text(p) }
 }

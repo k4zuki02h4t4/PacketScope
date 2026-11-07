@@ -7,3 +7,4 @@ pub mod icons;
 pub mod model;
 pub mod parse;
 pub mod system_setup;
+pub mod tls;

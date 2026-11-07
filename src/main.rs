@@ -41,7 +41,46 @@ fn window_icon() -> Option<iced::window::Icon> {
     iced::window::icon::from_rgba(buf, info.width, info.height).ok()
 }
 
+/// Last-resort crash log. This is a GUI-subsystem binary, so a panic
+/// normally kills the app silently (the window just disappears, which is
+/// what the v1.1.0 Headers-tab crash looked like). Append the panic and a
+/// backtrace to crash.log in the data directory so a failure leaves
+/// evidence that can be sent in with a bug report.
+fn install_crash_log() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let dir = data_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        };
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let entry = format!(
+            "\n=== {} ===\npanic: {msg}\nat: {loc}\nbacktrace:\n{}\n",
+            fmt_full(SystemTime::now()),
+            std::backtrace::Backtrace::force_capture()
+        );
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("crash.log"))
+        {
+            use std::io::Write;
+            let _ = f.write_all(entry.as_bytes());
+        }
+        default_hook(info);
+    }));
+}
+
 fn main() -> iced::Result {
+    install_crash_log();
     let args: Vec<String> = std::env::args().collect();
     // Full uninstall: when this binary runs as uninstall.exe (the setup
     // program places a copy under that name) or with --uninstall-app.
@@ -920,12 +959,20 @@ impl App {
         } else {
             ("↙", "RECEIVED", pal.green)
         };
+        // The pill must never be squeezed: with a long breadcrumb line the
+        // row used to hand it whatever width was left, and its label wrapped
+        // mid-word into a tall blob ("RECEIV/ED · 7.01/KB", v1.1.1 report).
+        // No wrapping here, and the breadcrumb below is the Fill element, so
+        // the pill is measured at its natural one-line width first and the
+        // breadcrumb wraps inside the space that remains.
         let pill = container(
             text(format!("{} {} · {}", pill_arrow, pill_word, fmt_size(f.bytes_up + f.bytes_down)))
                 .size(11)
                 .font(bold())
-                .color(pill_color),
+                .color(pill_color)
+                .wrapping(iced::widget::text::Wrapping::None),
         )
+        .width(Length::Shrink)
         .padding([4, 10])
         .style(move |_| container::Style {
             background: Some(Color::from_rgba(pill_color.r, pill_color.g, pill_color.b, 0.14).into()),
@@ -977,10 +1024,11 @@ impl App {
                     host
                 ))
                 .size(11.5)
-                .color(pal.faint),
-                iced::widget::horizontal_space(),
+                .color(pal.faint)
+                .width(Length::Fill),
                 pill,
             ]
+            .spacing(12)
             .align_y(iced::Alignment::Center),
             title_row,
             chips,
@@ -1056,6 +1104,13 @@ impl App {
             ]
             .spacing(16),
         );
+        if f.tls_decrypted {
+            col = col.push(
+                text("🔓 TLS を鍵ログ（SSLKEYLOGFILE）で復号済み — Payload / Headers は復号後の内容、Raw bytes は暗号化されたままのバイト列です。")
+                    .size(12)
+                    .color(pal.green),
+            );
+        }
         if f.bytes_up > 0 || !f.raw_up.is_empty() {
             col = col.push(self.body_section(pal, f, true));
         }
@@ -1079,12 +1134,14 @@ impl App {
         };
         let inner: Element<'_, Message> = match content {
             Content::Http { preview, .. } => {
-                text(preview.clone()).size(12).font(iced::Font::MONOSPACE).into()
+                text(sanitize_text(preview)).size(12).font(iced::Font::MONOSPACE).into()
             }
             Content::Plain { preview } => {
                 text(preview.clone()).size(12).font(iced::Font::MONOSPACE).into()
             }
-            Content::Dns { names } => text(format!("名前: {}", names.join(", "))).size(12.5).into(),
+            Content::Dns { names } => {
+                text(sanitize_text(&format!("名前: {}", names.join(", ")))).size(12.5).into()
+            }
             Content::TlsHello { server_name } => text(format!(
                 "TLS ハンドシェイク（ClientHello）— 接続先ホスト名 (SNI): {}",
                 server_name.clone().unwrap_or_else(|| "なし".into())
@@ -1094,6 +1151,13 @@ impl App {
             Content::Encrypted { kind } => column![
                 text(format!("{kind} で暗号化されたペイロードです。中身は復号できないため、宛先・量・時刻のみ記録されています。"))
                     .size(12.5),
+                text(if *kind == "TLS" {
+                    "ブラウザ（Chrome / Brave / Firefox 系）の鍵ログ（SSLKEYLOGFILE）を用意すると、このフローを復号して表示できます。手順は README 参照。"
+                } else {
+                    ""
+                })
+                .size(12)
+                .color(pal.sub),
                 text(hex_preview(raw, 96)).size(11).font(iced::Font::MONOSPACE).color(pal.faint),
             ]
             .spacing(8)
@@ -1131,11 +1195,15 @@ impl App {
 
     fn headers_tab(&self, pal: Pal, f: &Flow) -> Element<'_, Message> {
         let mut col = Column::new().spacing(14).width(Length::Fill);
-        for (label, raw) in [("SENT HEADERS ↗", &f.raw_up), ("RECEIVED HEADERS ↙", &f.raw_down)] {
-            if raw.is_empty() {
+        for (label, raw, plain) in [
+            ("SENT HEADERS ↗", &f.raw_up, &f.plain_up),
+            ("RECEIVED HEADERS ↙", &f.raw_down, &f.plain_down),
+        ] {
+            let bytes = if plain.is_empty() { raw } else { plain };
+            if bytes.is_empty() {
                 continue;
             }
-            let block = header_block(raw);
+            let block = header_block(bytes);
             col = col.push(
                 column![
                     text(label).size(10.5).font(bold()).color(pal.faint),
@@ -1458,13 +1526,54 @@ fn hex_dump(b: &[u8], max: usize) -> String {
 
 fn header_block(raw: &[u8]) -> String {
     let text = String::from_utf8_lossy(raw);
-    if let Some(pos) = text.find("\r\n\r\n") {
-        return text[..pos].to_string();
+    let head = if let Some(pos) = text.find("\r\n\r\n") {
+        &text[..pos]
+    } else if let Some(pos) = text.find("\n\n") {
+        &text[..pos]
+    } else {
+        &text
+    };
+    sanitize_text(&head.chars().take(1200).collect::<String>())
+}
+
+/// Make network-derived text safe to hand to the text renderer.
+///
+/// Packet payloads are arbitrary bytes. Decoded lossily, they can contain
+/// Unicode bidi paragraph separators (U+001C..=U+001E, U+0085, U+2029) and
+/// strong RTL characters; a line mixing the two makes cosmic-text — the
+/// text shaping library under iced — panic on an assertion about bidi
+/// paragraph direction, killing the whole app with no error shown
+/// (reproduced with the v1.1.0 code path: Headers tab of a TLS flow).
+/// Control and bidi-format characters therefore become '·' here (the same
+/// convention as the payload preview), CR/CRLF become LF, and everything
+/// else passes through unchanged.
+fn sanitize_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => out.push('·'),
+            // Bidi controls / paragraph & line separators / BOM: harmless
+            // in an editor, but they steer the shaper's paragraph logic.
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{feff}' => {
+                out.push('·')
+            }
+            c if ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c) =>
+            {
+                out.push('·')
+            }
+            c => out.push(c),
+        }
     }
-    if let Some(pos) = text.find("\n\n") {
-        return text[..pos].to_string();
-    }
-    text.chars().take(1200).collect()
+    out
 }
 
 // ---------------------------------------------------------------- settings
@@ -1527,6 +1636,7 @@ fn load_settings() -> Settings {
             "new_process" => s.alert_on_new_process = v.trim() == "1",
             "new_dest" => s.alert_on_new_destination = v.trim() == "1",
             "theme" => s.theme_dark = v.trim() != "light",
+            "keylog" => s.keylog_path = Some(v.trim().to_string()),
             _ => {}
         }
     }
@@ -1539,6 +1649,9 @@ fn save_settings(s: &Settings) {
     let mut out = String::new();
     for e in &s.excluded {
         out.push_str(&format!("exclude={e}\n"));
+    }
+    if let Some(p) = &s.keylog_path {
+        out.push_str(&format!("keylog={p}\n"));
     }
     out.push_str(&format!(
         "burst_mb={}\nnew_process={}\nnew_dest={}\ntheme={}\n",
@@ -1600,3 +1713,65 @@ fn uninstall_app() {
 
 #[cfg(not(windows))]
 fn uninstall_app() {}
+
+// ---------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn forbidden(c: char) -> bool {
+        if c == '\n' || c == '\t' {
+            return false;
+        }
+        c.is_control()
+            || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{feff}')
+            || ('\u{202a}'..='\u{202e}').contains(&c)
+            || ('\u{2066}'..='\u{2069}').contains(&c)
+    }
+
+    /// Regression test for the v1.1.0 crash: the Headers tab fed a lossy
+    /// decode of raw TLS bytes to the text renderer, and random payloads
+    /// regularly contain bidi paragraph separators + RTL characters, which
+    /// panicked cosmic-text. Whatever bytes a flow carries, the string the
+    /// Headers tab builds must be free of the steering characters.
+    #[test]
+    fn header_block_output_is_shape_safe_for_random_payloads() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        };
+        for _ in 0..2000 {
+            // TLS-record-like: structured header, then random bytes (the
+            // shape ClientHello / ServerHello payloads have).
+            let mut raw = vec![0x16, 0x03, 0x03, 0x05, 0x00, 0x01];
+            for _ in 0..2042 {
+                raw.push(next());
+            }
+            let block = header_block(&raw);
+            assert!(
+                !block.chars().any(forbidden),
+                "unsafe char survived sanitize: {block:?}"
+            );
+            assert!(block.chars().count() <= 1200);
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_normal_text_and_normalizes_crlf() {
+        assert_eq!(
+            sanitize_text("GET / HTTP/1.1\r\nHost: example.jp\r\n日本語 OK"),
+            "GET / HTTP/1.1\nHost: example.jp\n日本語 OK"
+        );
+        assert_eq!(sanitize_text("a\u{1c}b\u{202e}c\u{85}d"), "a·b·c·d");
+    }
+
+    #[test]
+    fn header_block_still_extracts_http_headers() {
+        let raw = b"GET /x HTTP/1.1\r\nHost: a.jp\r\n\r\nbody-body";
+        assert_eq!(header_block(raw), "GET /x HTTP/1.1\nHost: a.jp");
+    }
+}

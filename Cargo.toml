@@ -1,6 +1,6 @@
 [package]
 name = "netwatch"
-version = "1.0.0"
+version = "1.1.2"
 edition = "2021"
 license = "MIT"
 description = "Per-application network monitor for Windows: which app talked to whom, when, how much — and what it said when the protocol is plaintext."
@@ -23,6 +23,13 @@ etherparse = "0.16"
 pcap = { version = "2", optional = true }
 
 png = "0.17"
+
+# TLS decryption with browser key-log secrets (SSLKEYLOGFILE). Pure-Rust
+# RustCrypto crates so the Windows cross-build keeps working.
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

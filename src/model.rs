@@ -87,6 +87,11 @@ pub struct Flow {
     pub raw_down: Vec<u8>,
     /// Negotiated TLS version when a ServerHello was seen ("TLS 1.3"…).
     pub tls_version: Option<String>,
+    /// True when this TLS flow was decrypted with browser key-log secrets.
+    pub tls_decrypted: bool,
+    /// Decrypted application bytes per direction (empty unless decrypted).
+    pub plain_up: Vec<u8>,
+    pub plain_down: Vec<u8>,
     /// Set once the user has seen this flow in the UI.
     pub acknowledged: bool,
     /// How often the OS connection table reported this flow (table mode /
@@ -114,6 +119,9 @@ impl Flow {
             raw_up: Vec::new(),
             raw_down: Vec::new(),
             tls_version: None,
+            tls_decrypted: false,
+            plain_up: Vec::new(),
+            plain_down: Vec::new(),
             acknowledged: false,
             sightings: 0,
         }
@@ -149,6 +157,9 @@ pub struct Settings {
     pub alert_on_new_destination: bool,
     /// UI theme: PacketScope ships dark-first like the design mockups.
     pub theme_dark: bool,
+    /// SSLKEYLOGFILE path override (settings.txt `keylog=`). None = the
+    /// default `sslkeylog.log` in the app's data directory.
+    pub keylog_path: Option<String>,
 }
 
 impl Settings {
