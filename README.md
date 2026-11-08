@@ -32,17 +32,17 @@ Rust 製 Windows 用アプリケーションです。
 
 ### リリースパッケージの exe ファイルを実行する方法
 
-1. 本リポジトリの [Releases](../../releases) から `packetscope-v1.0.0.zip` をダウンロードし、展開します
-2. `packetscope-setup.exe` を実行します（UAC の確認で許可してください）
+1. 本リポジトリの [Releases](../../releases) から `packetscope-v*.*.*.zip` をダウンロードし、展開します
+2. `packetscope-setup.exe` を実行します（右クリック→管理者として実行）。
    - 本体が `C:\Program Files\PacketScope` に配置されます
    - スタートメニューとデスクトップにショートカットが作成されます
    - 「アプリと機能」にアンインストール用エントリが登録されます
 3. Npcap が無い場合は、公式インストーラ（npcap.com）のダウンロードと署名検証のあとインストーラが起動するので、画面の指示に従ってインストールしてください
 4. スタートメニューまたはデスクトップの「PacketScope」から起動します
 
-単体の `packetscope.exe` でも動作します（管理者として起動します）。
+既に Npcap をインストール済みの場合、`packetscope.exe` でも動作します（右クリック→管理者として実行）。
 
-アンインストールは「アプリと機能」から、または設置フォルダの `uninstall.exe` から行えます。
+アンインストールは `packetscope-setup.exe` を実行した場合、「アプリと機能」から、または設置フォルダの `uninstall.exe` から行えます。
 
 ## 📦 ビルド手順
 
