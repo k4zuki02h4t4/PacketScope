@@ -1,6 +1,6 @@
 [package]
 name = "netwatch"
-version = "1.1.2"
+version = "1.2.3"
 edition = "2021"
 license = "MIT"
 description = "Per-application network monitor for Windows: which app talked to whom, when, how much — and what it said when the protocol is plaintext."
@@ -51,6 +51,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Registry",
     "Win32_System_Services",
     "Win32_System_Threading",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Time",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
     "Win32_UI_Shell",

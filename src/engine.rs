@@ -16,6 +16,22 @@ pub struct Engine {
     pub alerts: VecDeque<Alert>,
     pub capture_status: String,
     resolver: TableResolver,
+    /// ETW process-start records (Windows): names processes that the
+    /// connection tables only ever saw as a bare, already-dead PID.
+    proc_feed: crate::etw::ProcFeed,
+    /// Learned image-name -> exe path associations from processes the
+    /// resolver could see alive. ETW events carry no path, so a
+    /// short-lived process named by the feed borrows the path of its
+    /// (usually long-lived) same-name siblings — as an estimate.
+    path_book: PathBook,
+    /// PID -> exe path for processes seen in sightings, used to find
+    /// a feed-named process's parent folder.
+    pid_paths: HashMap<u32, String>,
+    /// For flows named by the ETW feed: the parent PID from the start
+    /// record, so the parent's folder can be probed for the exe.
+    feed_parents: HashMap<FlowKey, u32>,
+    /// Flows whose parent folder was already probed (probe once).
+    probe_tried: HashSet<FlowKey>,
     settings: Settings,
     local_ips: HashSet<IpAddr>,
     seen_processes: HashSet<String>,
@@ -37,6 +53,8 @@ pub enum EngineEvent {
     Sightings(Vec<crate::attrib::ConnRow>),
     /// Human-readable capture state for the UI header.
     CaptureStatus(String),
+    /// A process started (ETW feed; Windows only).
+    ProcStart(crate::etw::ProcStart),
     Tick,
 }
 
@@ -52,6 +70,11 @@ impl Engine {
                 "接続表モード（このビルドには Npcap キャプチャが含まれていません）".to_string()
             },
             resolver: TableResolver::new(),
+            proc_feed: crate::etw::ProcFeed::new(),
+            path_book: PathBook::default(),
+            pid_paths: HashMap::new(),
+            feed_parents: HashMap::new(),
+            probe_tried: HashSet::new(),
             settings,
             local_ips: detect_local_ips(),
             seen_processes: HashSet::new(),
@@ -75,6 +98,7 @@ impl Engine {
                 EngineEvent::Frame(f, lt) => self.on_frame(&f, lt),
                 EngineEvent::Sightings(rows) => self.on_sightings(rows),
                 EngineEvent::CaptureStatus(s) => self.capture_status = s,
+                EngineEvent::ProcStart(p) => self.proc_feed.push(p),
                 EngineEvent::Tick => self.on_tick(),
             }
         }
@@ -86,6 +110,16 @@ impl Engine {
     fn on_sightings(&mut self, rows: Vec<crate::attrib::ConnRow>) {
         let now = SystemTime::now();
         for row in rows {
+            // Learn name->path and pid->path from every process the
+            // tables could resolve while alive; both are used to give
+            // feed-named (name-only) processes a path later.
+            if !row.proc.path.is_empty() {
+                self.path_book.learn(&row.proc.name, &row.proc.path);
+                if self.pid_paths.len() > 8192 {
+                    self.pid_paths.clear();
+                }
+                self.pid_paths.insert(row.proc.pid, row.proc.path.clone());
+            }
             let key = FlowKey {
                 proto: row.proto,
                 local_ip: row.local_ip,
@@ -106,9 +140,30 @@ impl Engine {
             flow.sightings += 1;
             flow.last_seen = now;
             flow.pid = Some(row.proc.pid);
-            flow.process_name = row.proc.name.clone();
-            flow.process_path = row.proc.path.clone();
-            flow.path_estimate = row.proc.path_estimate;
+            // Never downgrade a resolved name back to the "pid N"
+            // placeholder: the two resolvers (sightings thread and the
+            // engine's own) learn at different moments.
+            let incoming_unresolved =
+                row.proc.path.is_empty() && row.proc.name.starts_with("pid ");
+            let current_unresolved = flow.process_path.is_empty()
+                && (flow.process_name.is_empty()
+                    || flow.process_name.starts_with("pid "));
+            if !incoming_unresolved || current_unresolved {
+                flow.process_name = row.proc.name.clone();
+                flow.process_path = row.proc.path.clone();
+                flow.path_estimate = row.proc.path_estimate;
+            }
+            // ETW feed: even when the table resolver only has the bare
+            // PID (short-lived process, already gone), the process-start
+            // record usually knows the name.
+            if flow.process_path.is_empty() && flow.process_name.starts_with("pid ") {
+                if let Some(s) = self.proc_feed.name_for(row.proc.pid, now) {
+                    flow.process_name = s.name;
+                    if s.parent_pid != 0 {
+                        self.feed_parents.insert(key.clone(), s.parent_pid);
+                    }
+                }
+            }
             if is_new {
                 self.order.push_back(key.clone());
                 if !self.settings.is_excluded(&row.proc.name, &row.proc.path) {
@@ -121,14 +176,21 @@ impl Engine {
 
     fn on_tick(&mut self) {
         self.try_keylog_decrypt();
-        if self.last_resolve.elapsed().unwrap_or_default() > Duration::from_secs(1) {
+        if self.last_resolve.elapsed().unwrap_or_default() > Duration::from_millis(300) {
             self.resolver.refresh();
             self.last_resolve = SystemTime::now();
-            // late attribution for flows whose owner is now known
+            // Late attribution: flows whose owner is now known, plus
+            // flows stuck with the "pid N" placeholder whose owner the
+            // resolver can name by now (fast polling + the process
+            // census catch short-lived processes much more often).
             let updates: Vec<(FlowKey, crate::attrib::ProcInfo)> = self
                 .flows
                 .iter()
-                .filter(|(_, f)| f.pid.is_none())
+                .filter(|(_, f)| {
+                    f.pid.is_none()
+                        || (f.process_path.is_empty()
+                            && f.process_name.starts_with("pid "))
+                })
                 .filter_map(|(k, _)| {
                     self.resolver
                         .lookup(k.proto, k.local_port, k.remote_ip, k.remote_port)
@@ -137,10 +199,127 @@ impl Engine {
                 .collect();
             for (k, p) in updates {
                 if let Some(f) = self.flows.get_mut(&k) {
+                    // A flow that already knows its PID must never be
+                    // re-attributed to a different process (its local
+                    // port may have been reused since).
+                    if f.pid.is_some() && f.pid != Some(p.pid) {
+                        continue;
+                    }
                     f.pid = Some(p.pid);
                     f.process_name = p.name;
                     f.path_estimate = p.path_estimate;
                     f.process_path = p.path;
+                }
+            }
+            // ETW feed upgrade: flows that know their PID but are still
+            // wearing the "pid N" placeholder may belong to a process
+            // that started — and died — between table polls. The start
+            // record names it; match on the flow's first-seen time so a
+            // recycled PID resolves to the right instance.
+            let feed_updates: Vec<(FlowKey, String, u32)> = self
+                .flows
+                .iter()
+                .filter(|(_, f)| {
+                    f.pid.is_some()
+                        && f.process_path.is_empty()
+                        && f.process_name.starts_with("pid ")
+                })
+                .filter_map(|(k, f)| {
+                    self.proc_feed
+                        .name_for(f.pid.unwrap_or(0), f.first_seen)
+                        .map(|s| (k.clone(), s.name, s.parent_pid))
+                })
+                .collect();
+            for (k, name, parent_pid) in feed_updates {
+                if parent_pid != 0 {
+                    self.feed_parents.insert(k.clone(), parent_pid);
+                }
+                if let Some(f) = self.flows.get_mut(&k) {
+                    f.process_name = name;
+                }
+            }
+            // Path completion for named-but-pathless flows (the ETW
+            // feed yields names without paths): first probe the parent
+            // process's folder and common subfolders for the exe —
+            // helpers usually live next to their parent app — then
+            // fall back to the path learned from same-name processes
+            // that were seen alive. Both are inferences and are
+            // flagged as estimates.
+            // Each entry: (flow, name, path, parent_folder_was_probed)
+            let path_updates: Vec<(FlowKey, String, String, bool)> = self
+                .flows
+                .iter()
+                .filter(|(_, f)| {
+                    !f.process_name.is_empty()
+                        && !f.process_name.starts_with("pid ")
+                        && f.process_path.is_empty()
+                })
+                .filter_map(|(k, f)| {
+                    let name = f.process_name.clone();
+                    let mut probed = false;
+                    if !self.probe_tried.contains(k) {
+                        if let Some(ppid) = self.feed_parents.get(k) {
+                            if let Some(ppath) = self.pid_paths.get(ppid) {
+                                if let Some(dir) =
+                                    std::path::Path::new(ppath).parent()
+                                {
+                                    probed = true;
+                                    for cand in [
+                                        dir.join(&name),
+                                        dir.join("resources").join(&name),
+                                        dir.join("bin").join(&name),
+                                    ] {
+                                        if cand.is_file() {
+                                            return Some((
+                                                k.clone(),
+                                                name,
+                                                cand.to_string_lossy().into_owned(),
+                                                true,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.path_book
+                        .best(&name)
+                        .map(|p| (k.clone(), name, p, probed))
+                })
+                .collect();
+            for (k, _, _, probed) in &path_updates {
+                if *probed {
+                    self.probe_tried.insert(k.clone());
+                }
+            }
+            // Flows that could not be completed this round but whose
+            // parent folder was probed are also done probing.
+            let missed_probes: Vec<FlowKey> = self
+                .flows
+                .iter()
+                .filter(|(_, f)| f.process_path.is_empty())
+                .filter(|(k, _)| {
+                    !self.probe_tried.contains(k)
+                        && self
+                            .feed_parents
+                            .get(k)
+                            .map(|ppid| self.pid_paths.contains_key(ppid))
+                            .unwrap_or(false)
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in missed_probes {
+                self.probe_tried.insert(k);
+            }
+            for (k, name, p, _) in path_updates {
+                // Teach the book: siblings of this process (same name,
+                // equally pathless) can reuse a probed/learned path.
+                self.path_book.learn(&name, &p);
+                if let Some(f) = self.flows.get_mut(&k) {
+                    if f.process_path.is_empty() {
+                        f.process_path = p;
+                        f.path_estimate = true;
+                    }
                 }
             }
         }
@@ -454,11 +633,18 @@ pub fn spawn(
         let tx_cap = tx.clone();
         std::thread::spawn(move || crate::capture::run_pcap(tx_cap));
     }
+    // ETW process-start feed (Windows): names processes too
+    // short-lived for the connection tables. Silently absent when the
+    // kernel logger session can't be started.
+    crate::etw::spawn(tx.clone());
     {
         // Connection-table sightings always run: they are the fallback
         // when Npcap is missing (the app then still shows which app is
         // talking where), and they speed up process attribution when
-        // capture is active.
+        // capture is active. The poll is fast (150 ms) on purpose:
+        // short-lived processes — the ones that used to end up as
+        // anonymous "pid N" rows — must be caught while they are still
+        // alive, because once they exit only their PID remains.
         let tx_tab = tx.clone();
         std::thread::spawn(move || {
             let mut resolver = TableResolver::new();
@@ -467,7 +653,7 @@ pub fn spawn(
                 if tx_tab.send(EngineEvent::Sightings(rows)).is_err() {
                     break;
                 }
-                std::thread::sleep(Duration::from_secs(1));
+                std::thread::sleep(Duration::from_millis(150));
             }
         });
     }
@@ -479,6 +665,7 @@ pub fn spawn(
                 EngineEvent::Frame(f, lt) => engine.on_frame(&f, lt),
                 EngineEvent::Sightings(rows) => engine.on_sightings(rows),
                 EngineEvent::CaptureStatus(s) => engine.capture_status = s,
+                EngineEvent::ProcStart(p) => engine.proc_feed.push(p),
                 EngineEvent::Tick => {
                     engine.on_tick();
                     if last_snap.elapsed().unwrap_or_default() > Duration::from_millis(500) {
@@ -492,4 +679,53 @@ pub fn spawn(
         }
     });
     snap_rx
+}
+
+/// Learned image-name -> exe path associations. The same program can
+/// legitimately live at several paths (System32 vs SysWOW64), so the
+/// most frequently observed path wins.
+#[derive(Default)]
+struct PathBook {
+    map: HashMap<String, HashMap<String, u32>>,
+}
+
+impl PathBook {
+    fn learn(&mut self, name: &str, path: &str) {
+        if name.is_empty() || path.is_empty() {
+            return;
+        }
+        *self
+            .map
+            .entry(name.to_lowercase())
+            .or_default()
+            .entry(path.to_string())
+            .or_insert(0) += 1;
+    }
+
+    fn best(&self, name: &str) -> Option<String> {
+        self.map
+            .get(&name.to_lowercase())
+            .and_then(|m| m.iter().max_by_key(|(_, c)| **c).map(|(p, _)| p.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PathBook;
+
+    #[test]
+    fn path_book_picks_majority_and_ignores_case() {
+        let mut b = PathBook::default();
+        b.learn("cmd.exe", "C:\\Windows\\System32\\cmd.exe");
+        b.learn("CMD.EXE", "C:\\Windows\\System32\\cmd.exe");
+        b.learn("cmd.exe", "C:\\Windows\\SysWOW64\\cmd.exe");
+        assert_eq!(
+            b.best("Cmd.Exe").as_deref(),
+            Some("C:\\Windows\\System32\\cmd.exe")
+        );
+        assert_eq!(b.best("missing.exe"), None);
+        b.learn("", "C:\\x.exe");
+        b.learn("a.exe", "");
+        assert_eq!(b.best("a.exe"), None);
+    }
 }

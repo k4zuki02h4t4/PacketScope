@@ -2183,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "netwatch"
-version = "1.1.2"
+version = "1.2.3"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",

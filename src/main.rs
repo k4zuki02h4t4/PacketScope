@@ -92,7 +92,7 @@ fn main() -> iced::Result {
         uninstall_app();
         return Ok(());
     }
-    iced::application("PacketScope", App::update, App::view)
+    let result = iced::application("PacketScope", App::update, App::view)
         .theme(|app: &App| if app.settings.theme_dark { Theme::Dark } else { Theme::Light })
         .font(std::borrow::Cow::Borrowed(NOTO_SANS_JP))
         .default_font(iced::Font::with_name("Noto Sans JP"))
@@ -103,7 +103,11 @@ fn main() -> iced::Result {
             ..Default::default()
         })
         .subscription(App::subscription)
-        .run()
+        .run();
+    // Stop the ETW kernel-logger session if we started one, so it
+    // doesn't linger as an orphan after the window closes.
+    netwatch::etw::shutdown();
+    result
 }
 
 // ---------------------------------------------------------------- theme

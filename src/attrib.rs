@@ -1,8 +1,12 @@
 //! Which process owns a connection: Windows IP Helper tables + name lookup.
 //!
-//! The TCP/UDP owner tables are polled (default every 2 s) and cached by
-//! (proto, local port) — ports are the practical join key between a captured
-//! packet and a process. IPv6 rows are matched the same way.
+//! The TCP/UDP owner tables are polled fast (the sightings thread runs
+//! every 150 ms) and cached by (proto, local port) — ports are the
+//! practical join key between a captured packet and a process. IPv6 rows
+//! are matched the same way. Processes that were resolved successfully
+//! at least once are remembered in a census (10 min), so even after a
+//! short-lived process exits, its still-lingering connection rows can be
+//! answered with the name that was caught while it was alive.
 
 use crate::model::Proto;
 use std::collections::HashMap;
@@ -15,6 +19,16 @@ pub struct ProcInfo {
     /// The path was inferred (service table / well-known system
     /// location), not read from the process itself.
     pub path_estimate: bool,
+    /// Process creation time (Windows FILETIME as u64), when it could be
+    /// read. Two different processes can reuse one PID over time; the
+    /// creation time is what tells them apart in the census below.
+    pub created: Option<u64>,
+}
+
+/// True for the placeholder produced when a process could not be
+/// resolved at all (it had usually already exited).
+fn is_unresolved(p: &ProcInfo) -> bool {
+    p.path.is_empty() && p.name.starts_with("pid ")
 }
 
 /// One live connection row from the OS tables (used by table mode, where
@@ -54,6 +68,14 @@ pub struct TableResolver {
     /// tuple was never recorded (e.g. UDP endpoints without a remote).
     port_history: HashMap<(u8, u16), (ProcInfo, std::time::SystemTime)>,
     proc_cache: HashMap<u32, (ProcInfo, std::time::SystemTime)>,
+    /// Census of processes resolved successfully at least once, by PID.
+    /// Short-lived processes are usually gone by the time their (still
+    /// lingering, e.g. TIME_WAIT) connection rows are examined; if any
+    /// earlier poll caught the process alive, its name is remembered
+    /// here for a while and can still answer for the dead PID. Entries
+    /// carry the process creation time so a recycled PID belonging to a
+    /// different process is never answered with the old name.
+    census: HashMap<u32, (ProcInfo, std::time::SystemTime)>,
     /// Windows only: PID -> binary path from the service control manager.
     /// Many service processes refuse OpenProcess (protected), but their
     /// binary path is public configuration data in the SCM.
@@ -71,11 +93,18 @@ impl TableResolver {
             // Failed resolutions ("pid N" with no path) are retried after
             // a while instead of being cached forever: the process may
             // simply not have been queryable at that moment.
-            let failed = p.path.is_empty() && p.name.starts_with("pid ");
+            let failed = is_unresolved(p);
             if !failed
                 || at.elapsed().map(|d| d.as_secs() < 10).unwrap_or(false)
             {
-                return p.clone();
+                let p = p.clone();
+                if !failed {
+                    // Keep the census entry fresh while the process is
+                    // being seen, so it stays answerable right after the
+                    // process exits.
+                    self.note_census(&p);
+                }
+                return p;
             }
         }
         let mut info = query_process(pid);
@@ -90,9 +119,57 @@ impl TableResolver {
                 }
             }
         }
+        if is_unresolved(&info) {
+            // The process itself is gone — but an earlier poll may have
+            // caught it alive. Answer from the census if it is fresh and
+            // belongs to this same process instance.
+            if let Some(known) = self.census_info(pid, &info) {
+                info = known;
+            }
+        } else {
+            self.note_census(&info);
+        }
         self.proc_cache
             .insert(pid, (info.clone(), std::time::SystemTime::now()));
         info
+    }
+
+    /// Remember a successfully resolved process in the census.
+    fn note_census(&mut self, info: &ProcInfo) {
+        if is_unresolved(info) || info.pid == 0 {
+            return;
+        }
+        if let Some((old, _)) = self.census.get(&info.pid) {
+            match (old.created, info.created) {
+                // Same PID, different creation time: the PID was
+                // recycled — the new process replaces the old entry.
+                (Some(a), Some(b)) if a != b => {}
+                // Same process: keep the more complete record (the one
+                // that has a path) rather than downgrading it.
+                _ if old.path.is_empty() || !info.path.is_empty() => {}
+                _ => return,
+            }
+        }
+        self.census
+            .insert(info.pid, (info.clone(), std::time::SystemTime::now()));
+    }
+
+    /// The census answer for a PID whose live query just failed, if the
+    /// entry is fresh (< 10 min, matching the history retention) and not
+    /// contradicted by a creation time. A creation time can only be
+    /// present on `failed` in synthetic cases — a dead process yields
+    /// none — so in practice freshness decides.
+    fn census_info(&self, pid: u32, failed: &ProcInfo) -> Option<ProcInfo> {
+        let (known, at) = self.census.get(&pid)?;
+        if at.elapsed().map(|d| d.as_secs() >= 600).unwrap_or(true) {
+            return None;
+        }
+        if let (Some(a), Some(b)) = (known.created, failed.created) {
+            if a != b {
+                return None;
+            }
+        }
+        Some(known.clone())
     }
 
     /// (Re)build the SCM pid->path map at most every 30 s (Windows).
@@ -119,8 +196,14 @@ impl TableResolver {
         self.port_history.retain(|_, (_, at)| {
             now.duration_since(*at).map(|d| d.as_secs() < 600).unwrap_or(true)
         });
+        self.census.retain(|_, (_, at)| {
+            now.duration_since(*at).map(|d| d.as_secs() < 600).unwrap_or(true)
+        });
         if self.history.len() > 20_000 {
             self.history.clear();
+        }
+        if self.census.len() > 20_000 {
+            self.census.clear();
         }
     }
 
@@ -228,21 +311,32 @@ impl Resolver for TableResolver {
 #[cfg(windows)]
 fn query_process(pid: u32) -> ProcInfo {
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_INFORMATION,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+        PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_VM_READ,
     };
     // Kernel pseudo-processes have stable names; querying them fails.
     if pid == 0 {
-        return ProcInfo { pid, name: "System Idle Process".into(), path: String::new(), path_estimate: false };
+        return ProcInfo { pid, name: "System Idle Process".into(), path: String::new(), path_estimate: false, created: None };
     }
     if pid == 4 {
-        return ProcInfo { pid, name: "System".into(), path: String::new(), path_estimate: false };
+        return ProcInfo { pid, name: "System".into(), path: String::new(), path_estimate: false, created: None };
     }
     unsafe {
         let mut path = String::new();
+        let mut created: Option<u64> = None;
         // 1) Limited-information query (works for most processes).
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if !h.is_null() {
+            // Creation time identifies this process instance even if the
+            // PID is later recycled (used by the resolver's census).
+            let mut c: windows_sys::Win32::Foundation::FILETIME = std::mem::zeroed();
+            let mut x: windows_sys::Win32::Foundation::FILETIME = std::mem::zeroed();
+            let mut k: windows_sys::Win32::Foundation::FILETIME = std::mem::zeroed();
+            let mut u: windows_sys::Win32::Foundation::FILETIME = std::mem::zeroed();
+            if GetProcessTimes(h, &mut c, &mut x, &mut k, &mut u) != 0 {
+                created = Some(((c.dwHighDateTime as u64) << 32) | c.dwLowDateTime as u64);
+            }
             let mut buf = vec![0u16; 1024];
             let mut len = buf.len() as u32;
             if QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) != 0 {
@@ -269,7 +363,7 @@ fn query_process(pid: u32) -> ProcInfo {
         }
         if !path.is_empty() {
             let name = path.rsplit(['\\', '/']).next().unwrap_or("?").to_string();
-            return ProcInfo { pid, name, path, path_estimate: false };
+            return ProcInfo { pid, name, path, path_estimate: false, created };
         }
         // 3) Toolhelp snapshot: at least the image name (svchost.exe …),
         // which succeeds for many protected/service processes.
@@ -291,11 +385,11 @@ fn query_process(pid: u32) -> ProcInfo {
                 let root = std::env::var("SystemRoot")
                     .unwrap_or_else(|_| "C:\\Windows".to_string());
                 let path = format!("{root}\\System32\\{}", name.to_lowercase());
-                return ProcInfo { pid, name, path, path_estimate: true };
+                return ProcInfo { pid, name, path, path_estimate: true, created };
             }
-            return ProcInfo { pid, name, path: String::new(), path_estimate: false };
+            return ProcInfo { pid, name, path: String::new(), path_estimate: false, created };
         }
-        ProcInfo { pid, name: format!("pid {pid}"), path: String::new(), path_estimate: false }
+        ProcInfo { pid, name: format!("pid {pid}"), path: String::new(), path_estimate: false, created: None }
     }
 }
 
@@ -353,7 +447,7 @@ fn query_process(pid: u32) -> ProcInfo {
     } else {
         path.rsplit('/').next().unwrap_or("?").to_string()
     };
-    ProcInfo { pid, name, path, path_estimate: false }
+    ProcInfo { pid, name, path, path_estimate: false, created: None }
 }
 
 #[cfg(target_os = "macos")]
@@ -375,12 +469,12 @@ fn query_process(pid: u32) -> ProcInfo {
     } else {
         path.rsplit('/').next().unwrap_or("?").to_string()
     };
-    ProcInfo { pid, name, path, path_estimate: false }
+    ProcInfo { pid, name, path, path_estimate: false, created: None }
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn query_process(pid: u32) -> ProcInfo {
-    ProcInfo { pid, name: format!("pid {pid}"), path: String::new(), path_estimate: false }
+    ProcInfo { pid, name: format!("pid {pid}"), path: String::new(), path_estimate: false, created: None }
 }
 
 #[cfg(windows)]
@@ -791,6 +885,7 @@ mod linux_tables {
     }
 }
 
+
 /// macOS: `lsof` field output joined with proc_pidpath for exe paths.
 /// (macOS has no /proc; lsof ships with the OS.)
 #[cfg(target_os = "macos")]
@@ -896,5 +991,68 @@ mod mac_tables {
                 proc: r.proc(x.pid),
             })
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn named(pid: u32, name: &str, created: Option<u64>) -> ProcInfo {
+        ProcInfo {
+            pid,
+            name: name.to_string(),
+            path: format!("C:\\Apps\\{name}"),
+            path_estimate: false,
+            created,
+        }
+    }
+
+    fn failed(pid: u32) -> ProcInfo {
+        ProcInfo {
+            pid,
+            name: format!("pid {pid}"),
+            path: String::new(),
+            path_estimate: false,
+            created: None,
+        }
+    }
+
+    #[test]
+    fn census_answers_for_a_dead_pid_it_saw_alive() {
+        let mut r = TableResolver::new();
+        r.note_census(&named(4242, "helper.exe", Some(111)));
+        let got = r.census_info(4242, &failed(4242)).expect("census hit");
+        assert_eq!(got.name, "helper.exe");
+        assert_eq!(got.path, "C:\\Apps\\helper.exe");
+    }
+
+    #[test]
+    fn census_miss_for_unknown_pid() {
+        let r = TableResolver::new();
+        assert!(r.census_info(9999, &failed(9999)).is_none());
+    }
+
+    #[test]
+    fn census_entry_is_replaced_when_pid_is_recycled() {
+        let mut r = TableResolver::new();
+        r.note_census(&named(4242, "old.exe", Some(111)));
+        r.note_census(&named(4242, "new.exe", Some(222)));
+        let got = r.census_info(4242, &failed(4242)).expect("census hit");
+        assert_eq!(got.name, "new.exe");
+        // A stale query result carrying the OLD creation time must not be
+        // answered with the new process's name.
+        let mut stale = failed(4242);
+        stale.created = Some(111);
+        assert!(r.census_info(4242, &stale).is_none());
+    }
+
+    #[test]
+    fn unresolved_results_are_never_remembered() {
+        let mut r = TableResolver::new();
+        r.note_census(&failed(4242));
+        assert!(r.census_info(4242, &failed(4242)).is_none());
     }
 }
