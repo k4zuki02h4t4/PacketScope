@@ -42,6 +42,37 @@ pub fn confirm_box(_text: &str, _caption: &str) -> bool {
     false
 }
 
+/// Absolute path to a tool in %SystemRoot%\System32. Elevated
+/// processes should never spawn system tools by bare name: the
+/// loader searches the spawning executable's own directory before
+/// System32, so a same-named file planted next to the executable
+/// would run with our privileges (audit 2026-11-08).
+pub fn system32_tool(name: &str) -> std::path::PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("C:\\Windows"));
+    root.join("System32").join(name)
+}
+
+/// A short unpredictable tag from the OS-seeded hash state, the
+/// current time and this process's id — used by the app and the
+/// setup binary to make temporary file names unguessable, so a
+/// same-user process cannot pre-plant or predict the file an
+/// elevated process is about to run (audit 2026-11-08).
+pub fn random_tag() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let v = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+        ^ nanos as u64
+        ^ ((std::process::id() as u64) << 32);
+    format!("{v:016x}")
+}
+
 /// Read a string value from HKEY_LOCAL_MACHINE (used to locate the
 /// Npcap install directory). `value_name` may be "" for the default value.
 #[cfg(windows)]

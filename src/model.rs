@@ -80,6 +80,10 @@ pub struct Flow {
     pub packets_up: u64,
     pub packets_down: u64,
     pub remote_host: Option<String>,
+    /// Host from inside the decrypted TLS stream (the HTTP/2
+    /// :authority), which unlike the ClientHello SNI is covered by
+    /// ECH. Filled when the flow is decrypted (v1.3.1).
+    pub host_from_tls: Option<String>,
     pub content_up: Content,
     pub content_down: Content,
     /// First payload bytes per direction (for the Raw bytes view).
@@ -114,6 +118,7 @@ impl Flow {
             packets_up: 0,
             packets_down: 0,
             remote_host: None,
+            host_from_tls: None,
             content_up: Content::Unknown,
             content_down: Content::Unknown,
             raw_up: Vec::new(),

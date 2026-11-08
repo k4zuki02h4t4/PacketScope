@@ -67,10 +67,12 @@ fn install_crash_log() {
             fmt_full(SystemTime::now()),
             std::backtrace::Backtrace::force_capture()
         );
+        let log_path = dir.join("crash.log");
+        remove_if_reparse(&log_path);
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dir.join("crash.log"))
+            .open(&log_path)
         {
             use std::io::Write;
             let _ = f.write_all(entry.as_bytes());
@@ -82,6 +84,39 @@ fn install_crash_log() {
 fn main() -> iced::Result {
     install_crash_log();
     let args: Vec<String> = std::env::args().collect();
+    // The manifest asks Windows for elevation, but some launch routes
+    // still start this binary without an administrator token (seen in
+    // the field: launched directly, the uninstaller could neither
+    // start Npcap's uninstaller — error 740 — nor delete files under
+    // Program Files — error 5 — while the same binary launched from
+    // Settings > Apps ran elevated and everything worked). Secure the
+    // token ourselves: if not elevated, relaunch via ShellExecute
+    // "runas" once and exit. If the user declines the UAC prompt,
+    // that is a deliberate choice — exit silently instead of nagging
+    // with an explanation dialog (field feedback, v1.2.8). Only a
+    // relaunch that failed outright, or a retry that still came back
+    // without a token, gets the explanation.
+    #[cfg(windows)]
+    if !is_elevated() {
+        if !args.iter().any(|a| a == "--elevated-retry") {
+            match relaunch_elevated(&args) {
+                Relaunch::Started | Relaunch::Cancelled => return Ok(()),
+                Relaunch::Failed => {}
+            }
+        }
+        netwatch::system_setup::info_box(
+            "PacketScope の実行には管理者権限が必要です。\nUAC の確認画面で「はい」を選ぶか、管理者として実行してください。",
+            "PacketScope",
+        );
+        return Ok(());
+    }
+    // Cleanup helper mode: the uninstaller copies this binary to
+    // %TEMP% and relaunches it with --cleanup-helper to remove the
+    // install folder after the uninstaller itself has exited.
+    if args.iter().any(|a| a == "--cleanup-helper") {
+        cleanup_helper(&args);
+        return Ok(());
+    }
     // Full uninstall: when this binary runs as uninstall.exe (the setup
     // program places a copy under that name) or with --uninstall-app.
     let exe_stem = std::env::current_exe()
@@ -295,6 +330,67 @@ impl canvas::Program<Message> for DotsIcon {
     }
 }
 
+/// Padlock marker for decrypted flows in the history list, drawn as
+/// vectors for the same reason as ThemeIcon: the shipped font stack
+/// (bundled Noto Sans JP) has no U+1F513 glyph, so the lock-emoji text
+/// marker added in v1.3.0 rendered as tofu on Windows (field
+/// report). Feather-style lock outline in a 24x24 box: rounded body
+/// rect, shackle arc, keyhole dot.
+struct LockIcon {
+    color: Color,
+}
+
+impl canvas::Program<Message> for LockIcon {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let s = bounds.width.min(bounds.height) / 24.0;
+        let p = |x: f32, y: f32| Point::new(x * s, y * s);
+        let stroke = canvas::Stroke::default()
+            .with_color(self.color)
+            .with_width(2.0 * s)
+            .with_line_cap(canvas::LineCap::Round);
+        // Body: rounded rect from (5,11) to (19,21), radius 2.
+        let body = canvas::Path::new(|b| {
+            b.move_to(p(7.0, 11.0));
+            b.line_to(p(17.0, 11.0));
+            b.arc_to(p(19.0, 11.0), p(19.0, 13.0), 2.0 * s);
+            b.line_to(p(19.0, 19.0));
+            b.arc_to(p(19.0, 21.0), p(17.0, 21.0), 2.0 * s);
+            b.line_to(p(7.0, 21.0));
+            b.arc_to(p(5.0, 21.0), p(5.0, 19.0), 2.0 * s);
+            b.line_to(p(5.0, 13.0));
+            b.arc_to(p(5.0, 11.0), p(7.0, 11.0), 2.0 * s);
+            b.close();
+        });
+        frame.stroke(&body, stroke);
+        // Shackle: arc over the top (centre 12,11, radius 4, upper half).
+        let shackle = canvas::Path::new(|b| {
+            for i in 0..=24 {
+                let a = std::f32::consts::PI * (i as f32 / 24.0);
+                let pt = p(12.0 - 4.0 * a.cos(), 11.0 - 4.0 * a.sin());
+                if i == 0 {
+                    b.move_to(pt);
+                } else {
+                    b.line_to(pt);
+                }
+            }
+        });
+        frame.stroke(&shackle, stroke);
+        // Keyhole.
+        frame.fill(&canvas::Path::circle(p(12.0, 16.0), 1.4 * s), self.color);
+        vec![frame.into_geometry()]
+    }
+}
+
 /// "Open file location": Explorer with the file selected (Windows),
 /// Finder reveal (macOS), or the containing folder (Linux).
 fn open_file_location(path: &str) {
@@ -331,8 +427,12 @@ fn open_file_location(path: &str) {
             ok
         };
         if !done {
-            // Fallback: Explorer command line (quoted /select form).
-            let _ = std::process::Command::new("explorer")
+            // Fallback: Explorer command line (quoted /select form),
+            // spawned by absolute path rather than by bare name.
+            let explorer = std::env::var_os("SystemRoot")
+                .map(|r| std::path::PathBuf::from(r).join("explorer.exe"))
+                .unwrap_or_else(|| std::path::PathBuf::from("explorer"));
+            let _ = std::process::Command::new(explorer)
                 .arg(format!("/select,\"{path}\""))
                 .spawn();
         }
@@ -746,7 +846,7 @@ impl App {
                     || a.path.to_lowercase().contains(&search)
             })
             .collect();
-        let mut list = Column::new().spacing(2).padding([2, 8]);
+        let mut list = Column::new().spacing(2).padding(iced::Padding { top: 2.0, right: 18.0, bottom: 2.0, left: 8.0 });
         for agg in &shown {
             let selected = self.selected_app.as_deref() == Some(agg.key.as_str());
             let content = row![
@@ -829,26 +929,39 @@ impl App {
             return container(text("")).width(430).height(Length::Fill).style(move |_| pane_style(pal)).into();
         };
         let flows = self.selected_flows();
-        let mut list = Column::new().spacing(2).padding([2, 8]);
+        let mut list = Column::new().spacing(2).padding(iced::Padding { top: 2.0, right: 18.0, bottom: 2.0, left: 8.0 });
         for f in &flows {
             let selected = self.selected_flow.as_ref() == Some(&f.key);
             let up_dom = f.bytes_up >= f.bytes_down;
             let (arrow, acolor) = if up_dom { ("↗", pal.orange) } else { ("↙", pal.green) };
-            let host = f
-                .remote_host
-                .clone()
-                .unwrap_or_else(|| f.key.proto.name());
+            // Displayed destination: for ECH flows the SNI is only
+            // the cover name, so prefer the host recovered from
+            // inside the decrypted stream (v1.3.1); while an ECH
+            // flow is still encrypted, say so instead of presenting
+            // the cover name as the destination.
+            let host = match (&f.host_from_tls, &f.remote_host) {
+                (Some(real), _) if !real.is_empty() => real.clone(),
+                (Some(_), Some(cover)) => format!("{cover}（ECH の公開名）"),
+                (Some(_), None) => "ECH（宛先は暗号化）".to_string(),
+                (None, Some(h)) => h.clone(),
+                (None, None) => f.key.proto.name(),
+            };
+            let mut ip_cell = row![text(f.key.remote_ip.to_string()).size(12.5)]
+                .spacing(5)
+                .align_y(iced::Alignment::Center);
+            if f.tls_decrypted {
+                ip_cell = ip_cell.push(
+                    Canvas::new(LockIcon { color: pal.green }).width(13).height(13),
+                );
+            }
             let row_content = row![
                 text(fmt_time(f.first_seen))
                     .size(11.5)
                     .font(iced::Font::MONOSPACE)
                     .color(if selected { pal.accent } else { pal.sub }),
-                column![
-                    text(f.key.remote_ip.to_string()).size(12.5),
-                    text(host).size(11).color(pal.faint),
-                ]
-                .spacing(0)
-                .width(Length::Fill),
+                column![ip_cell, text(host).size(11).color(pal.faint),]
+                    .spacing(0)
+                    .width(Length::Fill),
                 text(arrow).size(12).color(acolor),
                 text(fmt_size(f.bytes_up + f.bytes_down))
                     .size(12)
@@ -956,7 +1069,13 @@ impl App {
             .into();
         };
         let app_name = if f.process_name.is_empty() { "不明" } else { &f.process_name };
-        let host = f.remote_host.clone().unwrap_or_default();
+        let host = match (&f.host_from_tls, &f.remote_host) {
+            (Some(real), _) if !real.is_empty() => real.clone(),
+            (Some(_), Some(cover)) => format!("{cover}（ECH の公開名）"),
+            (Some(_), None) => "ECH（宛先は暗号化）".to_string(),
+            (None, Some(h)) => h.clone(),
+            (None, None) => String::new(),
+        };
         let up_dom = f.bytes_up >= f.bytes_down;
         let (pill_arrow, pill_word, pill_color) = if up_dom {
             ("↗", "SENT", pal.orange)
@@ -996,7 +1115,12 @@ impl App {
                     }),
             );
         }
-        title_row = title_row.push(text(title).size(17).font(semibold()));
+        title_row = title_row.push(
+            text(title)
+                .size(17)
+                .font(semibold())
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+        );
         let mut chips = row![chip(pal, f.key.proto.name())].spacing(6);
         if let Some(v) = &f.tls_version {
             chips = chips.push(chip(pal, v.clone()));
@@ -1042,7 +1166,12 @@ impl App {
                 tab("Raw bytes", DetailTab::Raw),
             ]
             .spacing(4),
-            scrollable(body).height(Length::Fill),
+            scrollable(
+                container(body)
+                    .width(Length::Fill)
+                    .padding(iced::Padding { top: 0.0, right: 14.0, bottom: 0.0, left: 0.0 }),
+            )
+            .height(Length::Fill),
         ]
         .spacing(12)
         .padding([14, 18]);
@@ -1100,9 +1229,23 @@ impl App {
                 pair("CLIENT", format!("{}:{}", f.key.local_ip, f.key.local_port)),
                 pair(
                     "SERVER",
-                    match &f.remote_host {
-                        Some(h) => format!("{}:{} · {}", f.key.remote_ip, f.key.remote_port, h),
-                        None => format!("{}:{}", f.key.remote_ip, f.key.remote_port),
+                    match (&f.host_from_tls, &f.remote_host) {
+                        (Some(real), _) if !real.is_empty() => format!(
+                            "{}:{} · {}（復号から判明）",
+                            f.key.remote_ip, f.key.remote_port, real
+                        ),
+                        (Some(_), Some(cover)) => format!(
+                            "{}:{} · {}（ECH の公開名、本当の宛先は不明）",
+                            f.key.remote_ip, f.key.remote_port, cover
+                        ),
+                        (Some(_), None) => format!(
+                            "{}:{} · ECH（宛先は暗号化）",
+                            f.key.remote_ip, f.key.remote_port
+                        ),
+                        (None, Some(h)) => {
+                            format!("{}:{} · {}", f.key.remote_ip, f.key.remote_port, h)
+                        }
+                        (None, None) => format!("{}:{}", f.key.remote_ip, f.key.remote_port),
                     },
                 ),
             ]
@@ -1110,9 +1253,14 @@ impl App {
         );
         if f.tls_decrypted {
             col = col.push(
-                text("🔓 TLS を鍵ログ（SSLKEYLOGFILE）で復号済み — Payload / Headers は復号後の内容、Raw bytes は暗号化されたままのバイト列です。")
-                    .size(12)
-                    .color(pal.green),
+                row![
+                    Canvas::new(LockIcon { color: pal.green }).width(14).height(14),
+                    text("TLS を鍵ログ（SSLKEYLOGFILE）で復号済み — Payload / Headers は復号後の内容、Raw bytes は暗号化されたままのバイト列です。")
+                        .size(12)
+                        .color(pal.green),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
             );
         }
         if f.bytes_up > 0 || !f.raw_up.is_empty() {
@@ -1141,7 +1289,10 @@ impl App {
                 text(sanitize_text(preview)).size(12).font(iced::Font::MONOSPACE).into()
             }
             Content::Plain { preview } => {
-                text(preview.clone()).size(12).font(iced::Font::MONOSPACE).into()
+                // Sanitized like every other preview path: a Plain
+                // preview is still peer-controlled bytes (the HTTP/2
+                // summary path used to reach the renderer raw).
+                text(sanitize_text(preview)).size(12).font(iced::Font::MONOSPACE).into()
             }
             Content::Dns { names } => {
                 text(sanitize_text(&format!("名前: {}", names.join(", ")))).size(12.5).into()
@@ -1199,15 +1350,24 @@ impl App {
 
     fn headers_tab(&self, pal: Pal, f: &Flow) -> Element<'_, Message> {
         let mut col = Column::new().spacing(14).width(Length::Fill);
-        for (label, raw, plain) in [
-            ("SENT HEADERS ↗", &f.raw_up, &f.plain_up),
-            ("RECEIVED HEADERS ↙", &f.raw_down, &f.plain_down),
+        for (label, raw, plain, client) in [
+            ("SENT HEADERS ↗", &f.raw_up, &f.plain_up, true),
+            ("RECEIVED HEADERS ↙", &f.raw_down, &f.plain_down, false),
         ] {
             let bytes = if plain.is_empty() { raw } else { plain };
             if bytes.is_empty() {
                 continue;
             }
-            let block = header_block(bytes);
+            // Decrypted HTTP/2 has no textual headers: show the
+            // HPACK-decoded fields per stream instead of the raw
+            // frame bytes (v1.3.0).
+            let block = if f.tls_decrypted {
+                netwatch::http2::headers_text(bytes, client)
+                    .map(|t| sanitize_text(&t))
+                    .unwrap_or_else(|| header_block(bytes))
+            } else {
+                header_block(bytes)
+            };
             col = col.push(
                 column![
                     text(label).size(10.5).font(bold()).color(pal.faint),
@@ -1253,6 +1413,16 @@ impl App {
         col.into()
     }
 }
+
+/// Scrollbar clearance (v1.3.7): iced draws the vertical scrollbar
+/// *over* the content, so rows that extend to a pane's edge — the
+/// size column in the lists, the OVERVIEW values and payload boxes
+/// in the detail pane — ended up half-hidden under it (field report,
+/// v1.3.5). The fix pads the *content inside* each scrollable on the
+/// right (list columns: right 18; detail body: wrapped with right
+/// 14), leaving the bar itself at the pane's edge where it belongs.
+/// v1.3.6 tried padding the pane containers instead, which moved the
+/// bar inward too and left a dead strip at the edge — worse.
 
 // ---------------------------------------------------------------- widgets
 
@@ -1481,22 +1651,56 @@ fn short_path(p: &str) -> String {
     p.to_string()
 }
 
+/// Shape a peer-controlled headline for the detail title.
+///
+/// The request line comes straight from the wire (or from decrypted
+/// bytes) and is not shaped for display: a WebSocket upgrade to
+/// /hub?access_token=<JWT> produced a ~6 KB single-line title that
+/// flooded the detail pane (field report v1.3.2). Two rules:
+/// - the query string is *credentials by another name* (access
+///   tokens, session ids, signed URLs), so the title shows the path
+///   only; the full line stays available in the Payload/Headers
+///   tabs, one click away, where the user chose to look.
+/// - the result is sanitized and hard-capped, so no headline can
+///   ever take over the layout again.
+fn title_headline(headline: &str) -> String {
+    const MAX: usize = 110;
+    let clean = sanitize_text(headline);
+    let mut s = clean.trim().to_string();
+    if let Some(q) = s.find('?') {
+        // Keep the " (Host: …)" trailer parse.rs appends, if present.
+        let trailer = s[q..]
+            .find("  (Host: ")
+            .map(|i| s[q + i..].to_string())
+            .unwrap_or_default();
+        s = format!("{}?…{}", &s[..q], trailer);
+    }
+    if s.chars().count() > MAX {
+        s = s.chars().take(MAX).collect::<String>() + "…";
+    }
+    s
+}
+
 fn flow_title(f: &Flow) -> (Option<String>, String) {
     for c in [&f.content_up, &f.content_down] {
         if let Content::Http { headline, .. } = c {
-            let mut it = headline.splitn(2, ' ');
+            let shaped = title_headline(headline);
+            let mut it = shaped.splitn(2, ' ');
             let first = it.next().unwrap_or("");
             if ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"].contains(&first) {
                 let rest = it.next().unwrap_or("").to_string();
                 return (Some(first.to_string()), rest);
             }
-            return (None, headline.clone());
+            return (None, shaped);
         }
     }
-    let host = f
-        .remote_host
-        .clone()
-        .unwrap_or_else(|| f.key.remote_ip.to_string());
+    let host = match (&f.host_from_tls, &f.remote_host) {
+        (Some(real), _) if !real.is_empty() => real.clone(),
+        (Some(_), Some(cover)) => format!("{cover}（ECH の公開名）"),
+        (Some(_), None) => "ECH（宛先は暗号化）".to_string(),
+        (None, Some(h)) => h.clone(),
+        (None, None) => f.key.remote_ip.to_string(),
+    };
     let label = match (&f.content_up, &f.content_down) {
         (Content::TlsHello { .. }, _) | (_, Content::TlsHello { .. }) => "TLS".to_string(),
         (Content::Encrypted { kind }, _) | (_, Content::Encrypted { kind }) => kind.to_string(),
@@ -1621,8 +1825,18 @@ fn load_settings() -> Settings {
         theme_dark: true,
         ..Default::default()
     };
-    let Ok(text) = std::fs::read_to_string(data_dir().join("settings.txt")) else {
-        return s;
+    // Cap the read: settings.txt is a handful of short lines, and
+    // this process runs elevated (audit 2026-11-08).
+    let text = {
+        use std::io::Read;
+        let Ok(mut f) = std::fs::File::open(data_dir().join("settings.txt")) else {
+            return s;
+        };
+        let mut buf = Vec::new();
+        if f.by_ref().take(1024 * 1024).read_to_end(&mut buf).is_err() {
+            return s;
+        }
+        String::from_utf8_lossy(&buf).into_owned()
     };
     for line in text.lines() {
         let Some((k, v)) = line.split_once('=') else {
@@ -1634,7 +1848,10 @@ fn load_settings() -> Settings {
             }
             "burst_mb" => {
                 if let Ok(mb) = v.trim().parse::<u64>() {
-                    s.upload_burst_bytes_per_min = mb * 1024 * 1024;
+                    // Saturating: a huge value in the file must not
+                    // wrap the threshold to something tiny (audit
+                    // 2026-11-08).
+                    s.upload_burst_bytes_per_min = mb.saturating_mul(1024 * 1024);
                 }
             }
             "new_process" => s.alert_on_new_process = v.trim() == "1",
@@ -1650,12 +1867,16 @@ fn load_settings() -> Settings {
 fn save_settings(s: &Settings) {
     let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
+    // Values land in a line-based file; a value containing a newline
+    // (e.g. pasted into the exclude list) would otherwise inject
+    // extra settings lines on the next load (audit 2026-11-08).
+    let clean = |v: &str| v.replace(['\r', '\n'], " ");
     let mut out = String::new();
     for e in &s.excluded {
-        out.push_str(&format!("exclude={e}\n"));
+        out.push_str(&format!("exclude={}\n", clean(e)));
     }
     if let Some(p) = &s.keylog_path {
-        out.push_str(&format!("keylog={p}\n"));
+        out.push_str(&format!("keylog={}\n", clean(p)));
     }
     out.push_str(&format!(
         "burst_mb={}\nnew_process={}\nnew_dest={}\ntheme={}\n",
@@ -1665,6 +1886,62 @@ fn save_settings(s: &Settings) {
         if s.theme_dark { "dark" } else { "light" },
     ));
     let _ = std::fs::write(dir.join("settings.txt"), out);
+}
+
+// ------------------------------------------------------- file safety
+
+/// True when `path` itself is a symlink or a Windows reparse point
+/// (junction). Privileged code in this binary appends to log files in
+/// user-writable directories and recursively deletes a small set of
+/// folders; in both cases the *starting* path must not be a link
+/// someone planted, because following it would redirect the write /
+/// the deletion outside the intended tree (audit 2026-11-08).
+fn is_reparse_point(path: &std::path::Path) -> bool {
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if md.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_REPARSE_POINT covers junctions, which std's
+        // is_symlink does not classify as symlinks.
+        if md.file_attributes() & 0x0000_0400 != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// If `path` is a symlink / reparse point, remove the link itself so
+/// the caller goes on to create a fresh regular file at the path.
+fn remove_if_reparse(path: &std::path::Path) {
+    if is_reparse_point(path) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Recursively delete a directory tree, but never *through* a
+/// reparse point at the root: if the root itself is a link, only the
+/// link is removed. (Links below the root are already not followed
+/// by remove_dir_all.)
+fn remove_tree(path: &std::path::Path) -> std::io::Result<()> {
+    if is_reparse_point(path) {
+        return std::fs::remove_dir(path).or_else(|_| std::fs::remove_file(path));
+    }
+    std::fs::remove_dir_all(path)
+}
+
+/// Length + content digest of a file, for verifying that a copy we
+/// are about to execute is still the file we copied.
+fn file_digest(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::hash::Hasher;
+    let bytes = std::fs::read(path).ok()?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write(&bytes);
+    Some((bytes.len() as u64, h.finish()))
 }
 
 // ---------------------------------------------------------------- uninstall
@@ -1680,8 +1957,60 @@ fn uninstall_app() {
     ) {
         return;
     }
-    let home = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
-    let install_dir = std::path::PathBuf::from(home).join("PacketScope");
+    // The install folder is, by construction, where this
+    // uninstall.exe lives; trust the executable's own location over
+    // the ProgramFiles environment variable, which an unusual launch
+    // environment could have altered (audit 2026-11-08). The env
+    // derivation stays as a fallback for renamed copies.
+    let env_dir = std::env::var("ProgramFiles")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("C:\\Program Files"))
+        .join("PacketScope");
+    let exe_dir = std::env::current_exe().ok().and_then(|exe| {
+        let stem = exe
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        exe.parent()
+            .filter(|parent| {
+                stem.starts_with("uninstall")
+                    && parent
+                        .file_name()
+                        .map(|n| n.eq_ignore_ascii_case("PacketScope"))
+                        .unwrap_or(false)
+            })
+            .map(|parent| parent.to_path_buf())
+    });
+    let install_dir = match exe_dir {
+        Some(d) => {
+            if d != env_dir {
+                cleanup_log(&format!(
+                    "uninstaller: install dir from exe location: {}",
+                    d.to_string_lossy()
+                ));
+            }
+            d
+        }
+        None => env_dir,
+    };
+
+    // Npcap is a shared driver (Wireshark and other capture tools use
+    // it too), so removing it is strictly opt-in.
+    let npcap_uninstaller = npcap_uninstaller_path();
+    let remove_npcap = npcap_uninstaller.is_some()
+        && confirm_box(
+            "Npcap もアンインストールしますか？\n\nNpcap はパケット監視に使うドライバですが、Wireshark など他のアプリと共用のものです。PacketScope のためだけにインストールした場合は、削除しても問題ありません。",
+            "Npcap のアンインストール",
+        );
+
+    // A running executable image is locked and cannot be deleted, so
+    // stop the main app first if it is up. (This uninstaller runs
+    // under the name uninstall.exe, so it never matches itself.)
+    let _ = std::process::Command::new(netwatch::system_setup::system32_tool("taskkill.exe"))
+        .args(["/IM", "packetscope.exe", "/F"])
+        .creation_flags(0x0800_0000)
+        .status();
+
     // Remove shortcuts.
     if let Some(appdata) = std::env::var_os("APPDATA") {
         let sm = std::path::PathBuf::from(appdata)
@@ -1692,7 +2021,7 @@ fn uninstall_app() {
         let desk = std::path::PathBuf::from(profile).join("Desktop\\PacketScope.lnk");
         let _ = std::fs::remove_file(desk);
     }
-    let _ = std::process::Command::new("reg.exe")
+    let _ = std::process::Command::new(netwatch::system_setup::system32_tool("reg.exe"))
         .args([
             "delete",
             "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PacketScope",
@@ -1700,20 +2029,657 @@ fn uninstall_app() {
         ])
         .creation_flags(0x0800_0000)
         .status();
-    let _ = std::fs::remove_dir_all(data_dir());
-    // Delete our own folder last, from a detached shell.
+    let _ = remove_tree(&data_dir());
+    // Remove Npcap (if the user opted in) BEFORE the completion
+    // dialog: this waits for Npcap's uninstaller to actually finish,
+    // so "完了しました" is only shown once it is really gone.
+    if remove_npcap {
+        if let Some(un) = &npcap_uninstaller {
+            run_npcap_uninstaller(un);
+        }
+    }
+    // Delete our own folder last, via a detached copy of this binary
+    // running in cleanup-helper mode (see cleanup_helper).
     if install_dir.exists() {
-        let cmdline = format!(
-            "ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{}\"",
-            install_dir.to_string_lossy()
-        );
-        let _ = std::process::Command::new("cmd.exe")
-            .args(["/c", &cmdline])
-            .creation_flags(0x0800_0000 | 0x0000_0008)
-            .spawn();
+        spawn_cleanup_helper(&install_dir);
+        // Belt and suspenders: if a lock outlives the helper's
+        // retries, Windows removes the files at the next reboot.
+        for f in ["packetscope.exe", "uninstall.exe"] {
+            let p = install_dir.join(f);
+            if p.exists() {
+                delete_on_reboot(&p);
+            }
+        }
+        delete_on_reboot(&install_dir);
     }
     info_box("アンインストールが完了しました。", "PacketScope");
 }
+
+/// Whether this process holds an elevated (administrator) token.
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elev: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut ret_len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elev as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        );
+        CloseHandle(token);
+        ok != 0 && elev.TokenIsElevated != 0
+    }
+}
+
+/// Outcome of trying to relaunch this binary elevated.
+#[cfg(windows)]
+enum Relaunch {
+    /// The elevated instance was started.
+    Started,
+    /// The user declined the UAC prompt (ERROR_CANCELLED). A
+    /// deliberate choice, not a failure — the caller exits silently.
+    Cancelled,
+    /// The relaunch itself failed for another reason.
+    Failed,
+}
+
+/// Relaunch this binary elevated (ShellExecute "runas", which shows
+/// the UAC prompt), forwarding the current arguments plus an
+/// --elevated-retry marker so a failed elevation cannot loop.
+#[cfg(windows)]
+fn relaunch_elevated(args: &[String]) -> Relaunch {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_CANCELLED};
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    let Ok(exe) = std::env::current_exe() else {
+        return Relaunch::Failed;
+    };
+    let wide = |s: &str| OsStr::new(s).encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+    // Full Windows command-line quoting (the CommandLineToArgvW
+    // rules): the old version only wrapped space-containing args in
+    // quotes and left embedded quotes and trailing backslashes
+    // unescaped, which could bend how the elevated instance parsed
+    // its arguments (audit 2026-11-08).
+    let quote = |a: &str| {
+        if !a.is_empty()
+            && !a.contains([' ', '\t', '"'])
+        {
+            return a.to_string();
+        }
+        let mut out = String::with_capacity(a.len() + 2);
+        out.push('"');
+        let mut backslashes = 0usize;
+        for c in a.chars() {
+            match c {
+                '\\' => backslashes += 1,
+                '"' => {
+                    for _ in 0..(backslashes * 2 + 1) {
+                        out.push('\\');
+                    }
+                    out.push('"');
+                    backslashes = 0;
+                }
+                c => {
+                    for _ in 0..backslashes {
+                        out.push('\\');
+                    }
+                    backslashes = 0;
+                    out.push(c);
+                }
+            }
+        }
+        for _ in 0..(backslashes * 2) {
+            out.push('\\');
+        }
+        out.push('"');
+        out
+    };
+    let mut forwarded: Vec<String> = args.iter().skip(1).map(|a| quote(a)).collect();
+    forwarded.push("--elevated-retry".to_string());
+    let params = forwarded.join(" ");
+    let exe_s = exe.to_string_lossy();
+    let rc = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            wide("runas").as_ptr(),
+            wide(&exe_s).as_ptr(),
+            wide(&params).as_ptr(),
+            null_mut(),
+            1, // SW_SHOWNORMAL
+        )
+    };
+    if rc as isize > 32 {
+        return Relaunch::Started;
+    }
+    // ShellExecute reports a declined UAC prompt as SE_ERR_ACCESSDENIED
+    // with the last error set to ERROR_CANCELLED.
+    if unsafe { GetLastError() } == ERROR_CANCELLED {
+        return Relaunch::Cancelled;
+    }
+    Relaunch::Failed
+}
+
+/// Append one line to %TEMP%\packetscope-cleanup.log. Both the
+/// uninstaller and the cleanup helper write here, so a failed folder
+/// removal leaves a trace instead of failing silently.
+#[cfg(windows)]
+fn cleanup_log(msg: &str) {
+    use std::io::Write;
+    let path = std::env::var_os("TEMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join("packetscope-cleanup.log");
+    remove_if_reparse(&path);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{}] {msg}", fmt_full(std::time::SystemTime::now()));
+    }
+}
+
+/// Run Npcap's own uninstaller and return only once it is really
+/// finished, so the completion dialog in `uninstall_app` comes last.
+///
+/// Npcap's uninstaller is NSIS-based and hands the real work to a
+/// detached copy of itself (Au_.exe under a %TEMP%\~nsu* folder):
+/// the process we spawn exits within a second — the field log shows
+/// launch and exit in the same second despite the `_?=<install dir>`
+/// parameter that is supposed to make NSIS run in place. Waiting on
+/// the spawned process alone therefore declares completion while
+/// the uninstall window is still up (seen in v1.2.5 and v1.2.7).
+///
+/// v1.2.8 instead gated on machine state (Npcap's registry key,
+/// driver service, uninstaller file) — and in the field those
+/// conditions never lined up: the log stops at "confirming removal"
+/// and, because the cleanup helper and the completion dialog sit
+/// behind this function, the whole uninstall stalled. That gating
+/// design was a mistake. The state checks stay, but only as log
+/// diagnostics.
+///
+/// What the user actually watches is the uninstaller's window, so
+/// v1.2.9 waits on processes: snapshot the uninstaller-like
+/// processes before spawning, then wait until the spawned process
+/// has exited AND no new uninstaller-like process (the detached
+/// copy included) is alive. A hard deadline and a state line in
+/// the log every 10 s keep any future stall bounded and visible.
+#[cfg(windows)]
+fn run_npcap_uninstaller(uninstaller: &std::path::Path) {
+    let Some(dir) = uninstaller.parent().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    let before: std::collections::HashSet<u32> = uninstaller_like_processes(&dir)
+        .into_iter()
+        .map(|(pid, _)| pid)
+        .collect();
+    let arg = format!("_?={}", dir.to_string_lossy());
+    cleanup_log("uninstaller: launching Npcap uninstaller (synchronous)");
+    let mut child = match std::process::Command::new(uninstaller).arg(&arg).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            cleanup_log(&format!(
+                "uninstaller: Npcap uninstaller spawn failed: {e}"
+            ));
+            return;
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let mut announced: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut last_state_log: Option<std::time::Instant> = None;
+    loop {
+        let child_running = matches!(child.try_wait(), Ok(None));
+        let active: Vec<(u32, String)> = uninstaller_like_processes(&dir)
+            .into_iter()
+            .filter(|(pid, _)| !before.contains(pid))
+            .collect();
+        for (pid, path) in &active {
+            if announced.insert(*pid) {
+                cleanup_log(&format!(
+                    "uninstaller: Npcap uninstaller process active: pid {pid} {path}"
+                ));
+            }
+        }
+        if !child_running && active.is_empty() {
+            cleanup_log("uninstaller: Npcap uninstall finished (no uninstaller process left)");
+            break;
+        }
+        if last_state_log.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10)) {
+            last_state_log = Some(std::time::Instant::now());
+            cleanup_log(&format!(
+                "uninstaller: waiting for Npcap: child_running={child_running} active_processes={} registry_key_present={} service_present={} uninstaller_file_present={}",
+                active.len(),
+                npcap_registry_present(),
+                npcap_service_present(),
+                uninstaller.exists(),
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            cleanup_log("uninstaller: Npcap wait timed out after 300s; continuing anyway");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    // The uninstaller does not reliably delete itself, so remove
+    // the leftover exe afterwards; driver files that are pending a
+    // reboot stay Npcap's own responsibility.
+    let _ = std::fs::remove_file(uninstaller);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+/// Whether Npcap's registry key (which stores its install dir) is
+/// still there. Diagnostic for the Npcap wait log only — v1.2.8
+/// gated completion on this and stalled in the field.
+#[cfg(windows)]
+fn npcap_registry_present() -> bool {
+    ["SOFTWARE\\Npcap", "SOFTWARE\\WOW6432Node\\Npcap"]
+        .iter()
+        .any(|k| netwatch::system_setup::read_registry_sz_local_machine(k, "").is_some())
+}
+
+/// Whether the `npcap` driver service is still registered.
+/// Diagnostic for the Npcap wait log only; when the SCM cannot be
+/// reached we answer "present" (unknown reads as still there).
+#[cfg(windows)]
+fn npcap_service_present() -> bool {
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT,
+        SERVICE_QUERY_STATUS,
+    };
+    let name: Vec<u16> = "npcap".encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let mgr = OpenSCManagerW(std::ptr::null_mut(), std::ptr::null_mut(), SC_MANAGER_CONNECT);
+        if mgr.is_null() {
+            return true;
+        }
+        let svc = OpenServiceW(mgr, name.as_ptr(), SERVICE_QUERY_STATUS);
+        let present = !svc.is_null();
+        if present {
+            CloseServiceHandle(svc);
+        }
+        CloseServiceHandle(mgr);
+        present
+    }
+}
+
+/// All currently running processes that look like an Npcap
+/// uninstaller: anything running out of the Npcap install dir, or a
+/// detached uninstaller copy under %TEMP% (NSIS runs its self-copy
+/// as Au_.exe inside a ~nsu* folder). Returns (pid, image path).
+/// Callers diff two snapshots to follow one uninstall run without
+/// reacting to uninstallers that were already open beforehand.
+#[cfg(windows)]
+fn uninstaller_like_processes(npcap_dir: &std::path::Path) -> Vec<(u32, String)> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let dir_prefix = format!("{}\\", npcap_dir.to_string_lossy().to_lowercase());
+    let temp_l = std::env::var("TEMP").unwrap_or_default().to_lowercase();
+    let mut found = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        // Snapshot failure is INVALID_HANDLE_VALUE (-1), not null;
+        // checking only for null let the calls below run on an
+        // invalid handle (they fail harmlessly, but say what we mean).
+        if snap.is_null() || snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return found;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let pid = entry.th32ProcessID;
+                if pid != 0 && pid != std::process::id() {
+                    let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                    if !h.is_null() {
+                        let mut buf = vec![0u16; 1024];
+                        let mut len = buf.len() as u32;
+                        if QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) != 0 {
+                            let path =
+                                String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
+                            let file = path.rsplit('\\').next().unwrap_or("");
+                            if path.starts_with(&dir_prefix)
+                                || file == "au_.exe"
+                                || path.contains("~nsu")
+                                || (file.contains("uninstall")
+                                    && !temp_l.is_empty()
+                                    && path.starts_with(&temp_l))
+                            {
+                                found.push((pid, path));
+                            }
+                        }
+                        CloseHandle(h);
+                    }
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    found
+}
+
+/// Locate Npcap's own uninstaller, if Npcap is installed.
+#[cfg(windows)]
+fn npcap_uninstaller_path() -> Option<std::path::PathBuf> {
+    for key in ["SOFTWARE\\Npcap", "SOFTWARE\\WOW6432Node\\Npcap"] {
+        if let Some(dir) = netwatch::system_setup::read_registry_sz_local_machine(key, "") {
+            let un = std::path::PathBuf::from(dir).join("uninstall.exe");
+            if un.exists() {
+                return Some(un);
+            }
+        }
+    }
+    let home = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
+    let un = std::path::PathBuf::from(home).join("Npcap").join("uninstall.exe");
+    un.exists().then_some(un)
+}
+
+/// Register `path` for deletion at the next reboot
+/// (MoveFileEx with a null destination). Requires admin, which the
+/// app manifest already guarantees. Returns whether the registration
+/// succeeded — from a non-elevated process it silently fails, which
+/// is exactly what the log needs to show.
+#[cfg(windows)]
+fn delete_on_reboot(path: &std::path::Path) -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+    let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
+    unsafe { MoveFileExW(wide.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) != 0 }
+}
+
+/// Spawn a detached copy of this binary (placed in %TEMP%) in
+/// cleanup-helper mode to remove the install folder once this
+/// uninstaller process has exited.
+///
+/// This replaces two earlier shell-based attempts, neither of which
+/// worked on the user's machine: v1.2.3 fired a single `rmdir` from a
+/// detached cmd after a ~2 s wait (the completion dialog kept
+/// uninstall.exe alive and locked, so the delete lost the race), and
+/// v1.2.4's retrying batch script still left the executables behind
+/// and produced repeatedly flashing console windows. The helper is
+/// the same GUI-subsystem binary, so no console window can appear,
+/// and it logs its attempts to %TEMP%\packetscope-cleanup.log.
+#[cfg(windows)]
+fn spawn_cleanup_helper(install_dir: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(temp) = std::env::var_os("TEMP").map(std::path::PathBuf::from) else {
+        return;
+    };
+    // Remove a leftover script from the v1.2.4 batch mechanism.
+    let _ = std::fs::remove_file(temp.join("packetscope-cleanup.bat"));
+    // Unique *and unguessable* name per run: a helper from an earlier
+    // uninstall may still be alive (a running exe cannot be
+    // overwritten, so the name must differ), and a name predictable
+    // from the pid alone would let a same-user process pre-plant or
+    // swap the file we are about to run elevated (audit 2026-11-08).
+    let helper = temp.join(format!(
+        "packetscope-uninstall-helper-{}-{}.exe",
+        std::process::id(),
+        netwatch::system_setup::random_tag()
+    ));
+    if let Err(e) = std::fs::copy(&exe, &helper) {
+        cleanup_log(&format!("uninstaller: helper copy failed: {e}"));
+        return;
+    }
+    // Verify the copy is still exactly our binary before running it
+    // with an administrator token.
+    let want = file_digest(&exe);
+    if want.is_none() || file_digest(&helper) != want {
+        cleanup_log("uninstaller: helper copy failed integrity check; not spawning it");
+        let _ = std::fs::remove_file(&helper);
+        return;
+    }
+    let pid = std::process::id().to_string();
+    // Start the helper with %TEMP% as its working directory: a
+    // process cannot remove its own current directory, and the
+    // inherited one is often the install folder itself.
+    match std::process::Command::new(&helper)
+        .args(["--cleanup-helper", &install_dir.to_string_lossy(), &pid])
+        .current_dir(&temp)
+        .creation_flags(0x0800_0000 | 0x0000_0008)
+        .spawn()
+    {
+        Ok(_) => cleanup_log("uninstaller: helper spawned"),
+        Err(e) => cleanup_log(&format!("uninstaller: helper spawn failed: {e}")),
+    }
+}
+
+/// The only folder the cleanup helper may ever delete: a folder
+/// named PacketScope directly under a Program Files root. Anything
+/// else in the target argument means the invocation did not come
+/// from our uninstaller (audit 2026-11-08).
+#[cfg(windows)]
+fn valid_cleanup_target(dir: &std::path::Path) -> bool {
+    let named = dir
+        .file_name()
+        .map(|n| n.eq_ignore_ascii_case("PacketScope"))
+        .unwrap_or(false);
+    if !named {
+        return false;
+    }
+    let Some(parent) = dir.parent() else {
+        return false;
+    };
+    let parent_s = parent
+        .to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .to_lowercase();
+    let mut roots: Vec<String> = ["C:\\Program Files", "C:\\Program Files (x86)"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(v) = std::env::var(var) {
+            roots.push(v);
+        }
+    }
+    roots.iter().any(|r| {
+        parent_s == r.trim_end_matches(['\\', '/']).to_lowercase()
+    })
+}
+
+/// Full path of a process's executable image, when queryable.
+#[cfg(windows)]
+fn process_image_path(pid: u32) -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut buf = vec![0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(h);
+        if ok == 0 || len == 0 {
+            return None;
+        }
+        buf.truncate(len as usize);
+        Some(std::path::PathBuf::from(String::from_utf16_lossy(&buf)))
+    }
+}
+
+/// Cleanup helper mode: `--cleanup-helper <install_dir> <parent_pid>`.
+///
+/// Waits for the uninstaller process to exit (its image locks the
+/// folder while it lives), then retries removing the install folder
+/// for up to ~2 minutes. Falls back to delete-on-reboot for whatever
+/// is left, and registers its own %TEMP% copy for reboot deletion as
+/// well. Every step is logged to %TEMP%\packetscope-cleanup.log.
+#[cfg(windows)]
+fn cleanup_helper(args: &[String]) {
+    // A process cannot remove its own current directory, and the
+    // inherited working directory may be the install folder itself
+    // (e.g. when the uninstaller was launched from Explorer). Move to
+    // %TEMP% first — v1.2.5 missed this, which could leave an empty
+    // install folder behind even with all files deleted.
+    if let Some(temp) = std::env::var_os("TEMP") {
+        let _ = std::env::set_current_dir(std::path::PathBuf::from(temp));
+    }
+    let log = cleanup_log;
+    let pos = args.iter().position(|a| a == "--cleanup-helper");
+    let (dir_arg, pid_arg) = match pos {
+        Some(i) => (args.get(i + 1), args.get(i + 2)),
+        None => (None, None),
+    };
+    let Some(dir_arg) = dir_arg else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir_arg);
+    log(&format!(
+        "helper: start, target = {}",
+        dir.to_string_lossy()
+    ));
+    // This mode deletes a folder tree with an administrator token,
+    // and the self-elevation path forwards arguments verbatim — so
+    // the helper must not take the caller's word for what may be
+    // deleted (audit 2026-11-08). Before this check, anyone who
+    // could get this binary launched with a crafted argument and a
+    // UAC consent had an arbitrary-folder recursive delete.
+    let Some(parent_pid) = pid_arg.and_then(|s| s.parse::<u32>().ok()) else {
+        log("helper: missing/invalid parent pid argument; refusing");
+        return;
+    };
+    if !valid_cleanup_target(&dir) {
+        log("helper: target is not the PacketScope install folder; refusing");
+        return;
+    }
+    // When the parent can be identified, it must be the uninstaller
+    // running from inside the target folder (that is how the real
+    // flow works). An already-exited parent cannot be checked; the
+    // target check above still bounds what can be deleted then.
+    match process_image_path(parent_pid) {
+        Some(image) => {
+            let in_place = image
+                .parent()
+                .map(|p| {
+                    p.to_string_lossy().eq_ignore_ascii_case(&dir.to_string_lossy())
+                })
+                .unwrap_or(false);
+            if !in_place {
+                log(&format!(
+                    "helper: parent image {} is not inside the target folder; refusing",
+                    image.to_string_lossy()
+                ));
+                return;
+            }
+        }
+        None => log("helper: parent image not queryable (already exited?); proceeding"),
+    }
+    // A v1.2.4 batch script may still be looping; removing the file
+    // makes its cmd abort instead of continuing.
+    if let Some(temp) = std::env::var_os("TEMP") {
+        let _ = std::fs::remove_file(
+            std::path::PathBuf::from(temp).join("packetscope-cleanup.bat"),
+        );
+    }
+    // Wait (bounded, up to ~5 minutes) for the uninstaller to exit.
+    // A single 60 s wait proved too short in the field: a completion
+    // dialog left open longer than that made the helper start while
+    // uninstall.exe was still locking the folder.
+    {
+        let pid = parent_pid;
+        unsafe {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+            };
+            let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if !h.is_null() {
+                let mut waited_ms = 0u32;
+                loop {
+                    let rc = WaitForSingleObject(h, 5_000);
+                    if rc == 0 || waited_ms >= 300_000 {
+                        log(&format!(
+                            "helper: parent wait rc = {rc} after ~{waited_ms} ms"
+                        ));
+                        break;
+                    }
+                    waited_ms += 5_000;
+                }
+                CloseHandle(h);
+            } else {
+                log("helper: parent handle unavailable, proceeding");
+            }
+        }
+    }
+    // Record what is in the folder, so a later failure can be tied
+    // to a specific file.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let names: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        log(&format!("helper: folder contents: {}", names.join(", ")));
+    }
+    let mut removed = !dir.exists();
+    for attempt in 1..=120 {
+        if removed {
+            break;
+        }
+        match remove_tree(&dir) {
+            Ok(()) => {
+                removed = !dir.exists();
+                log(&format!("helper: removed on attempt {attempt}"));
+            }
+            Err(e) => {
+                if attempt == 1 || attempt % 30 == 0 {
+                    log(&format!("helper: attempt {attempt} failed: {e}"));
+                }
+            }
+        }
+        if !removed {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+    if dir.exists() {
+        log("helper: still present after retries, registering reboot deletion");
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let ok = delete_on_reboot(&p);
+                log(&format!(
+                    "helper: reboot-delete {} -> {ok}",
+                    p.to_string_lossy()
+                ));
+            }
+        }
+        let ok = delete_on_reboot(&dir);
+        log(&format!("helper: reboot-delete folder -> {ok}"));
+    }
+    if let Ok(me) = std::env::current_exe() {
+        delete_on_reboot(&me);
+    }
+    log(&format!("helper: done, removed = {removed}"));
+}
+
+#[cfg(not(windows))]
+fn cleanup_helper(_args: &[String]) {}
 
 #[cfg(not(windows))]
 fn uninstall_app() {}
@@ -1777,5 +2743,39 @@ mod tests {
     fn header_block_still_extracts_http_headers() {
         let raw = b"GET /x HTTP/1.1\r\nHost: a.jp\r\n\r\nbody-body";
         assert_eq!(header_block(raw), "GET /x HTTP/1.1\nHost: a.jp");
+    }
+
+    /// Regression test for the v1.3.2 field report: a decrypted
+    /// WebSocket upgrade whose request line carried a ~6 KB access
+    /// token flooded the detail title and broke the layout. The
+    /// shaped title must drop the query (credentials), stay short,
+    /// and be shape-safe.
+    #[test]
+    fn title_headline_drops_query_and_caps_length() {
+        let token = "eyJ".to_string() + &"a".repeat(5000);
+        let headline = format!("GET /hub?access_token={token} HTTP/1.1  (Host: example.com)");
+        let shaped = title_headline(&headline);
+        assert!(shaped.starts_with("GET /hub?…"), "got: {shaped}");
+        assert!(shaped.contains("(Host: example.com)"));
+        assert!(!shaped.contains("access_token="), "token leaked into title: {shaped}");
+        assert!(shaped.chars().count() <= 111, "title too long: {}", shaped.chars().count());
+        // Ordinary headlines pass through untouched.
+        assert_eq!(
+            title_headline("GET /index.html HTTP/1.1  (Host: a.jp)"),
+            "GET /index.html HTTP/1.1  (Host: a.jp)"
+        );
+        // Sanitization is part of shaping.
+        assert_eq!(title_headline("GET /a\u{202e}b HTTP/1.1"), "GET /a·b HTTP/1.1");
+    }
+
+    #[test]
+    fn http1_host_extracts_request_host() {
+        let req = b"GET /hub?x=1 HTTP/1.1\r\nhost: Notifications.Example.com\r\n\r\n";
+        assert_eq!(
+            netwatch::parse::http1_host(req).as_deref(),
+            Some("Notifications.Example.com")
+        );
+        assert_eq!(netwatch::parse::http1_host(b"HTTP/1.1 200 OK\r\n\r\n"), None);
+        assert_eq!(netwatch::parse::http1_host(b"GET / HTTP/1.1\r\n\r\n"), None);
     }
 }

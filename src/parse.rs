@@ -171,9 +171,42 @@ fn looks_like_tls(p: &[u8]) -> bool {
 }
 
 /// First line of an HTTP request/response + start of body, if this is HTTP.
+/// The Host of an HTTP/1.x request in decrypted bytes — used to
+/// name the real destination of a decrypted flow when the SNI was
+/// only an ECH public name (v1.3.4; HTTP/2 uses :authority instead).
+pub fn http1_host(p: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(&p[..p.len().min(8192)]).ok()?;
+    let mut lines = text.lines();
+    let first = lines.next()?;
+    if !["GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "CONNECT "]
+        .iter()
+        .any(|m| first.starts_with(m))
+    {
+        return None;
+    }
+    for line in lines.take(40) {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            if k.eq_ignore_ascii_case("host") {
+                let h = v.trim();
+                if !h.is_empty() {
+                    return Some(h.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn http_headline(p: &[u8]) -> Option<Content> {
     let text = std::str::from_utf8(&p[..p.len().min(8192)]).ok()?;
-    let first = text.lines().next()?.trim().to_string();
+    // Cap the stored headline: request lines can run to kilobytes
+    // (tokens in the query). Display shaping happens in the UI; the
+    // cap here keeps an unbounded peer string out of every other
+    // consumer (titles, lists, logs).
+    let first: String = text.lines().next()?.trim().chars().take(512).collect();
     let is_req = ["GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "CONNECT "]
         .iter()
         .any(|m| first.starts_with(m));
@@ -292,6 +325,48 @@ fn tls_sni(p: &[u8]) -> Option<String> {
     None
 }
 
+/// True when the ClientHello carries the encrypted_client_hello
+/// extension (RFC 9849, type 0xfe0d): the visible SNI is then only
+/// the ECH public name (a cover host), and the real destination is
+/// inside the encrypted part — unknowable until the flow itself is
+/// decrypted and its :authority can be read (v1.3.1).
+pub fn client_hello_has_ech(p: &[u8]) -> bool {
+    if p.len() < 43 {
+        return false;
+    }
+    let mut off = 5 + 4 + 2 + 32;
+    if off >= p.len() {
+        return false;
+    }
+    let sid_len = p[off] as usize;
+    off += 1 + sid_len;
+    if off + 2 > p.len() {
+        return false;
+    }
+    let cs_len = u16::from_be_bytes([p[off], p[off + 1]]) as usize;
+    off += 2 + cs_len;
+    if off >= p.len() {
+        return false;
+    }
+    let cm_len = p[off] as usize;
+    off += 1 + cm_len;
+    if off + 2 > p.len() {
+        return false;
+    }
+    let ext_total = u16::from_be_bytes([p[off], p[off + 1]]) as usize;
+    off += 2;
+    let ext_end = (off + ext_total).min(p.len());
+    while off + 4 <= ext_end {
+        let etype = u16::from_be_bytes([p[off], p[off + 1]]);
+        let elen = u16::from_be_bytes([p[off + 2], p[off + 3]]) as usize;
+        if etype == 0xfe0d {
+            return true;
+        }
+        off += 4 + elen;
+    }
+    false
+}
+
 /// Printable preview of a payload, truncated, control bytes shown as '·'.
 pub fn preview_text(p: &[u8]) -> String {
     p.iter()
@@ -355,51 +430,87 @@ pub fn tls_server_version(p: &[u8]) -> Option<String> {
     }
 }
 
+/// Make a peer-supplied display string (SNI host name, DNS name)
+/// safe to show anywhere in the UI: control characters — newline
+/// and tab included; a host label never legitimately contains them —
+/// and bidirectional formatting characters become '·'. Without this,
+/// a name crafted by the remote side can visually spoof which host
+/// a flow talked to in the list and detail views (audit 2026-11-08;
+/// the payload preview already sanitized, the host label did not).
+pub fn sanitize_display(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(c,
+                    '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}'
+                    | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+            {
+                '·'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// True when the payload starts a TLS ClientHello.
 pub fn is_client_hello(p: &[u8]) -> bool {
     p.len() >= 6 && p[0] == 0x16 && p[5] == 0x01
 }
 
 /// Classify bytes recovered by TLS decryption (the payload the app itself
-/// saw). HTTP/1 answers reuse the normal headline parser; HTTP/2 is binary,
-/// so DATA frame payloads are extracted as the readable part.
-pub fn classify_decrypted(p: &[u8]) -> Content {
+/// saw). HTTP/1 answers reuse the normal headline parser; HTTP/2 goes
+/// through the http2 module, which decodes HPACK headers and undoes
+/// content-encodings, so the preview is the actual requests/responses
+/// instead of the raw frame bytes (v1.3.0; previously DATA payloads
+/// were concatenated blindly and compressed bodies rendered as noise).
+/// `client` selects the direction's framing (client streams start
+/// with the connection preface, server streams with frames).
+pub fn classify_decrypted(p: &[u8], client: bool) -> Content {
     if p.is_empty() {
         return Content::Unknown;
     }
     if let Some(http) = http_headline(p) {
         return http;
     }
-    if p.starts_with(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") {
-        let mut data = Vec::new();
-        let mut off = 24usize;
-        while off + 9 <= p.len() {
-            let len = ((p[off] as usize) << 16) | ((p[off + 1] as usize) << 8) | p[off + 2] as usize;
-            let ftype = p[off + 3];
-            let flags = p[off + 4];
-            let body = &p[off + 9..(off + 9 + len).min(p.len())];
-            if ftype == 0 {
-                // DATA: strip padding when PADDED (0x8) is set.
-                if flags & 0x8 != 0 && !body.is_empty() {
-                    let pad = body[0] as usize;
-                    let end = body.len().saturating_sub(pad);
-                    if end >= 1 {
-                        data.extend_from_slice(&body[1..end]);
-                    }
-                } else {
-                    data.extend_from_slice(body);
-                }
-            }
-            off += 9 + len;
+    if crate::http2::is_client(p) || crate::http2::is_server(p) {
+        if let Some(text) = crate::http2::summarize(p, client) {
+            return Content::Plain { preview: text };
         }
-        if data.is_empty() {
-            return Content::Plain {
-                preview: "HTTP/2 ストリーム（DATA フレームはまだありません。ヘッダーは HPACK 圧縮のため表示できません）".to_string(),
-            };
-        }
-        return Content::Plain {
-            preview: format!("HTTP/2 DATA フレームの内容:\n{}", preview_text(&data)),
-        };
     }
     Content::Plain { preview: preview_text(p) }
+}
+
+#[cfg(test)]
+mod ech_tests {
+    /// Build a minimal ClientHello record carrying the given
+    /// extension types, to exercise the ECH detector.
+    fn hello_with_exts(types: &[u16]) -> Vec<u8> {
+        let mut v = vec![0x16, 0x03, 0x03, 0x00, 0x00]; // record hdr (len patched later)
+        v.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // handshake type + len
+        v.extend_from_slice(&[0x03, 0x03]); // version
+        v.extend_from_slice(&[7u8; 32]); // random
+        v.push(0); // session id len
+        v.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher suites
+        v.extend_from_slice(&[0x01, 0x00]); // compression
+        let mut exts = Vec::new();
+        for t in types {
+            exts.extend_from_slice(&t.to_be_bytes());
+            exts.extend_from_slice(&[0x00, 0x00]); // len 0
+        }
+        v.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        v.extend_from_slice(&exts);
+        let total = v.len() - 5;
+        v[3] = (total >> 8) as u8;
+        v[4] = total as u8;
+        v
+    }
+
+    #[test]
+    fn detects_ech_extension() {
+        assert!(super::client_hello_has_ech(&hello_with_exts(&[0x0000, 0xfe0d])));
+        assert!(super::client_hello_has_ech(&hello_with_exts(&[0xfe0d])));
+        assert!(!super::client_hello_has_ech(&hello_with_exts(&[0x0000, 0x002b])));
+        assert!(!super::client_hello_has_ech(&[0x16, 0x03]));
+    }
 }

@@ -4,6 +4,7 @@ pub mod attrib;
 pub mod capture;
 pub mod engine;
 pub mod etw;
+pub mod http2;
 pub mod icons;
 pub mod model;
 pub mod parse;

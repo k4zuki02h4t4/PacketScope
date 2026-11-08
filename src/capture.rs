@@ -13,7 +13,10 @@ use crate::engine::EngineEvent;
 use std::sync::mpsc::{SyncSender, TrySendError};
 
 #[cfg(feature = "npcap")]
-pub fn run_pcap(tx: SyncSender<EngineEvent>) {
+pub fn run_pcap(
+    tx: SyncSender<EngineEvent>,
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
     use pcap::{Capture, Device};
 
     #[cfg(windows)]
@@ -58,14 +61,28 @@ pub fn run_pcap(tx: SyncSender<EngineEvent>) {
     let mut threads = Vec::new();
     for mut cap in handles {
         let t = tx.clone();
+        let queued_dev = queued_bytes.clone();
         let linktype = cap.get_datalink().0;
         threads.push(std::thread::spawn(move || loop {
             match cap.next_packet() {
                 Ok(pkt) => {
-                    // Bounded queue: under a packet flood we drop frames
+                    let data = pkt.data.to_vec();
+                    let len = data.len();
+                    // Bounded queue, in bytes as well as in frame
+                    // count: under a packet flood we drop frames
                     // instead of growing memory without limit.
-                    match t.try_send(EngineEvent::Frame(pkt.data.to_vec(), linktype)) {
+                    if queued_dev.load(std::sync::atomic::Ordering::Relaxed) + len
+                        > crate::engine::MAX_QUEUED_FRAME_BYTES
+                    {
+                        continue;
+                    }
+                    queued_dev.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+                    match t.try_send(EngineEvent::Frame(data, linktype)) {
                         Err(TrySendError::Disconnected(_)) => return,
+                        Err(_) => {
+                            queued_dev
+                                .fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
+                        }
                         _ => {}
                     }
                 }
@@ -110,9 +127,11 @@ fn prepare_npcap() {
         }
     }
     // Start the driver service if it is stopped (we run as admin).
+    // Absolute System32 path: a bare "sc.exe" would be resolved with
+    // this process's own directory first (audit 2026-11-08).
     use std::os::windows::process::CommandExt;
     for svc in ["npcap", "npf"] {
-        let _ = std::process::Command::new("sc.exe")
+        let _ = std::process::Command::new(crate::system_setup::system32_tool("sc.exe"))
             .args(["start", svc])
             .creation_flags(0x0800_0000)
             .output();
@@ -120,4 +139,8 @@ fn prepare_npcap() {
 }
 
 #[cfg(not(feature = "npcap"))]
-pub fn run_pcap(_tx: SyncSender<EngineEvent>) {}
+pub fn run_pcap(
+    _tx: SyncSender<EngineEvent>,
+    _queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+}

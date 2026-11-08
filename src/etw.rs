@@ -115,14 +115,15 @@ mod imp {
     use crate::engine::EngineEvent;
     use std::ffi::c_void;
     use std::io::Write as _;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::SyncSender;
     use std::time::{Duration, SystemTime};
     use windows_sys::core::GUID;
     use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS};
     use windows_sys::Win32::System::Diagnostics::Etw::{
         CloseTrace, ControlTraceW, OpenTraceW, ProcessTrace, StartTraceW,
-        CONTROLTRACE_HANDLE, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
+        CONTROLTRACE_HANDLE, EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY,
+        EVENT_TRACE_CONTROL_STOP,
         EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_LOGFILEW,
         EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
         EVENT_TRACE_SYSTEM_LOGGER_MODE, PROCESSTRACE_HANDLE,
@@ -149,6 +150,11 @@ mod imp {
     static LOG_CB: AtomicUsize = AtomicUsize::new(0);
     static LOG_SEND: AtomicUsize = AtomicUsize::new(0);
     static LOG_FAIL: AtomicUsize = AtomicUsize::new(0);
+    /// Set by shutdown(): the consumer loop must not run its
+    /// stop-and-recreate recovery once the app is on its way out —
+    /// a ProcessTrace 4201 racing the shutdown stop could otherwise
+    /// resurrect the session during teardown (audit 2026-11-08).
+    static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
     fn log_path() -> std::path::PathBuf {
         let base = std::env::var_os("LOCALAPPDATA")
@@ -159,19 +165,44 @@ mod imp {
         dir.join("etw.log")
     }
 
+    /// True when the log path itself is a symlink / reparse point.
+    /// This process runs elevated; appending to (or truncating) a
+    /// planted link would redirect the write outside the data
+    /// directory (audit 2026-11-08).
+    fn log_path_is_link(p: &std::path::Path) -> bool {
+        let Ok(md) = std::fs::symlink_metadata(p) else {
+            return false;
+        };
+        let mut link = md.file_type().is_symlink();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            link = link || (md.file_attributes() & 0x0000_0400 != 0);
+        }
+        link
+    }
+
     fn dlog(msg: &str) {
+        let path = log_path();
+        if log_path_is_link(&path) {
+            let _ = std::fs::remove_file(&path);
+        }
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(log_path())
+            .open(&path)
         {
             let _ = writeln!(f, "{msg}");
         }
     }
 
     fn dlog_reset() {
+        let path = log_path();
+        if log_path_is_link(&path) {
+            let _ = std::fs::remove_file(&path);
+        }
         let _ = std::fs::write(
-            log_path(),
+            &path,
             format!("PacketScope v{} ETW diagnostics\n", env!("CARGO_PKG_VERSION")),
         );
     }
@@ -204,6 +235,7 @@ mod imp {
     }
 
     pub fn shutdown() {
+        STOP_REQUESTED.store(true, Ordering::Relaxed);
         let session = SESSION.lock().ok().and_then(|mut g| g.take());
         if let Some(s) = session {
             if s.ours {
@@ -211,13 +243,12 @@ mod imp {
                     let name_w: Vec<u16> =
                         SESSION_NAME.encode_utf16().chain(std::iter::once(0)).collect();
                     let total = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 1024;
-                    let mut buf = vec![0u8; total];
+                    let mut buf = props_buffer(total);
                     let props = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
                     (*props).Wnode.BufferSize = total as u32;
                     (*props).LoggerNameOffset =
                         std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-                    let tail = buf
-                        .as_mut_ptr()
+                    let tail = (buf.as_mut_ptr() as *mut u8)
                         .add(std::mem::size_of::<EVENT_TRACE_PROPERTIES>())
                         as *mut u16;
                     std::ptr::copy_nonoverlapping(name_w.as_ptr(), tail, name_w.len());
@@ -228,17 +259,59 @@ mod imp {
         }
     }
 
+    /// Backing store for an EVENT_TRACE_PROPERTIES blob, allocated
+    /// with the alignment the struct requires. A plain Vec<u8> only
+    /// guarantees 1-byte alignment, so casting its pointer to the
+    /// struct type was formally undefined behavior even though the
+    /// allocator has always returned well-aligned blocks in practice
+    /// (audit 2026-11-08). A Vec<u64> guarantees 8-byte alignment.
+    fn props_buffer(total: usize) -> Vec<u64> {
+        vec![0u64; total.div_ceil(8)]
+    }
+
+    /// LogFileMode of the session currently owning the kernel logger
+    /// name, when it can be queried.
+    unsafe fn session_logfile_mode(name_w: &[u16]) -> Option<u32> {
+        let total = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 1024;
+        let mut buf = props_buffer(total);
+        let props = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
+        (*props).Wnode.BufferSize = total as u32;
+        let rc = ControlTraceW(
+            CONTROLTRACE_HANDLE { Value: 0 },
+            name_w.as_ptr(),
+            props,
+            EVENT_TRACE_CONTROL_QUERY,
+        );
+        if rc == ERROR_SUCCESS {
+            Some((*props).LogFileMode)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the named session is one we may stop: it must be a
+    /// real-time session that exists but cannot be consumed — the
+    /// signature of a zombie left by an earlier crashed run of this
+    /// app (which only ever starts real-time sessions). A session in
+    /// another mode belongs to a foreign tool (e.g. a file-mode
+    /// trace) and is left alone (audit 2026-11-08).
+    unsafe fn session_is_stoppable_zombie(name_w: &[u16]) -> bool {
+        match session_logfile_mode(name_w) {
+            Some(mode) => mode & EVENT_TRACE_REAL_TIME_MODE != 0,
+            None => false,
+        }
+    }
+
     /// Stop whatever session currently owns the kernel logger name.
     /// Used to clear a zombie session (e.g. left behind by a crashed
     /// run) that reports ALREADY_EXISTS but cannot be consumed.
     unsafe fn stop_by_name(name_w: &[u16]) {
         let total = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 1024;
-        let mut buf = vec![0u8; total];
+        let mut buf = props_buffer(total);
         let props = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
         (*props).Wnode.BufferSize = total as u32;
         (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-        let tail = buf
-            .as_mut_ptr()
+        let tail = (buf.as_mut_ptr() as *mut u8)
             .add(std::mem::size_of::<EVENT_TRACE_PROPERTIES>()) as *mut u16;
         std::ptr::copy_nonoverlapping(name_w.as_ptr(), tail, name_w.len());
         let rc = ControlTraceW(
@@ -255,7 +328,7 @@ mod imp {
 
     unsafe fn start_session(name_w: &[u16], mode: u32) -> (u32, CONTROLTRACE_HANDLE) {
         let total = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 1024;
-        let mut buf = vec![0u8; total];
+        let mut buf = props_buffer(total);
         let props = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
         (*props).Wnode.BufferSize = total as u32;
         (*props).Wnode.Guid = SYSTEM_TRACE_CONTROL_GUID;
@@ -268,8 +341,7 @@ mod imp {
         (*props).EnableFlags = EVENT_TRACE_FLAG_PROCESS;
         (*props).FlushTimer = 1;
         (*props).LoggerNameOffset = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
-        let tail = buf
-            .as_mut_ptr()
+        let tail = (buf.as_mut_ptr() as *mut u8)
             .add(std::mem::size_of::<EVENT_TRACE_PROPERTIES>()) as *mut u16;
         std::ptr::copy_nonoverlapping(name_w.as_ptr(), tail, name_w.len());
         let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
@@ -329,14 +401,21 @@ mod imp {
                 dlog(&format!("attempt {attempt}: OpenTrace handle={:#x}", trace.Value));
                 if trace.Value == 0 || trace.Value == u64::MAX {
                     let _ = Box::from_raw(logfile.Context as *mut SyncSender<EngineEvent>);
-                    if !cleaned {
-                        // Unusable session squatting on the name:
-                        // clear it and retry.
+                    if !cleaned
+                        && !STOP_REQUESTED.load(Ordering::Relaxed)
+                        && session_is_stoppable_zombie(&name_w)
+                    {
+                        // Unusable real-time session squatting on
+                        // the name (a zombie left by an earlier run
+                        // of this app): clear it and retry. A session
+                        // in any other mode belongs to a foreign tool
+                        // and is left alone.
                         stop_by_name(&name_w);
                         cleaned = true;
                         std::thread::sleep(Duration::from_millis(250));
                         continue;
                     }
+                    dlog("existing session cannot be consumed and is not a stoppable zombie; ETW feed disabled");
                     return;
                 }
                 // Blocks until the session is stopped (shutdown() at
@@ -346,11 +425,16 @@ mod imp {
                 dlog(&format!("attempt {attempt}: ProcessTrace returned rc={prc}"));
                 CloseTrace(trace);
                 let _ = Box::from_raw(logfile.Context as *mut SyncSender<EngineEvent>);
-                if prc == ERR_INSTANCE_NOT_FOUND && !cleaned {
+                if prc == ERR_INSTANCE_NOT_FOUND
+                    && !cleaned
+                    && !STOP_REQUESTED.load(Ordering::Relaxed)
+                    && session_is_stoppable_zombie(&name_w)
+                {
                     // The session exists on paper but cannot be
-                    // consumed (zombie / incompatible mode). Stop it
-                    // by name and retry, switching mode when we owned
-                    // the broken one ourselves.
+                    // consumed (zombie / incompatible mode) — and it
+                    // is a real-time session, i.e. one of ours. Stop
+                    // it by name and retry, switching mode when we
+                    // owned the broken one ourselves.
                     stop_by_name(&name_w);
                     cleaned = true;
                     if ours && mode_idx + 1 < modes.len() {
@@ -522,8 +606,14 @@ mod imp {
 
     fn filetime_to_system_time(ft: i64) -> SystemTime {
         const EPOCH_DIFF_100NS: i64 = 116_444_736_000_000_000;
+        // Clamp to ~200 years past the Unix epoch: the value comes
+        // from the kernel, but an absurd one must not overflow the
+        // nanos multiplication or the SystemTime addition and panic
+        // (audit 2026-11-08).
+        const MAX_TICKS: u64 = 63_072_000_000_000_000; // 200 y in 100 ns units
         if ft > EPOCH_DIFF_100NS {
-            SystemTime::UNIX_EPOCH + Duration::from_nanos(((ft - EPOCH_DIFF_100NS) as u64) * 100)
+            let ticks = ((ft - EPOCH_DIFF_100NS) as u64).min(MAX_TICKS);
+            SystemTime::UNIX_EPOCH + Duration::from_nanos(ticks * 100)
         } else {
             SystemTime::now()
         }

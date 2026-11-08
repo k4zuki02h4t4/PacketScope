@@ -402,7 +402,8 @@ unsafe fn snapshot_name(pid: u32) -> Option<String> {
         TH32CS_SNAPPROCESS,
     };
     let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if snap.is_null() {
+    // Failure is INVALID_HANDLE_VALUE (-1), not null.
+    if snap.is_null() || snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
         return None;
     }
     let mut entry: PROCESSENTRY32W = std::mem::zeroed();
@@ -489,6 +490,35 @@ mod win_tables {
     };
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
+    /// Byte buffer with 8-byte-aligned storage, for OS structures
+    /// that are read back through typed pointers (MIB tables,
+    /// service records). A plain Vec<u8> guarantees only 1-byte
+    /// alignment, so those casts were formally undefined behavior
+    /// even though the allocator has always returned well-aligned
+    /// blocks in practice (audit 2026-11-08).
+    pub struct AlignedBuf {
+        storage: Vec<u64>,
+        len: usize,
+    }
+
+    impl AlignedBuf {
+        pub fn new(len: usize) -> Self {
+            AlignedBuf { storage: vec![0u64; len.div_ceil(8)], len }
+        }
+        pub fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.storage.as_mut_ptr() as *mut u8
+        }
+        pub fn as_ptr(&self) -> *const u8 {
+            self.storage.as_ptr() as *const u8
+        }
+        pub fn len(&self) -> usize {
+            self.len
+        }
+        pub fn as_slice(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len) }
+        }
+    }
+
     pub struct TcpRowRaw {
         local_ip: IpAddr,
         local_port: u16,
@@ -508,9 +538,9 @@ mod win_tables {
         let mut size: u32 = 0;
         GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, AF_INET as u32, TCP_TABLE_OWNER_PID_ALL, 0);
         if size > 0 {
-            let mut buf = vec![0u8; size as usize];
+            let mut buf = AlignedBuf::new(size as usize);
             if GetExtendedTcpTable(buf.as_mut_ptr() as *mut c_void, &mut size, 0, AF_INET as u32, TCP_TABLE_OWNER_PID_ALL, 0) == 0 {
-                let count = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+                let count = u32::from_ne_bytes(buf.as_slice()[0..4].try_into().unwrap()) as usize;
                 let rs = std::mem::size_of::<MIB_TCPROW_OWNER_PID>();
                 for i in 0..count {
                     let off = 4 + i * rs;
@@ -534,9 +564,9 @@ mod win_tables {
         let mut size: u32 = 0;
         GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, AF_INET6 as u32, TCP_TABLE_OWNER_PID_ALL, 0);
         if size > 0 {
-            let mut buf = vec![0u8; size as usize];
+            let mut buf = AlignedBuf::new(size as usize);
             if GetExtendedTcpTable(buf.as_mut_ptr() as *mut c_void, &mut size, 0, AF_INET6 as u32, TCP_TABLE_OWNER_PID_ALL, 0) == 0 {
-                let count = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+                let count = u32::from_ne_bytes(buf.as_slice()[0..4].try_into().unwrap()) as usize;
                 let rs = std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>();
                 for i in 0..count {
                     let off = 4 + i * rs;
@@ -563,11 +593,11 @@ mod win_tables {
             let mut size: u32 = 0;
             GetExtendedUdpTable(std::ptr::null_mut(), &mut size, 0, family, UDP_TABLE_OWNER_PID, 0);
             if size == 0 { continue; }
-            let mut buf = vec![0u8; size as usize];
+            let mut buf = AlignedBuf::new(size as usize);
             if GetExtendedUdpTable(buf.as_mut_ptr() as *mut c_void, &mut size, 0, family, UDP_TABLE_OWNER_PID, 0) != 0 {
                 continue;
             }
-            let count = u32::from_ne_bytes(buf[0..4].try_into().unwrap()) as usize;
+            let count = u32::from_ne_bytes(buf.as_slice()[0..4].try_into().unwrap()) as usize;
             if family == AF_INET as u32 {
                 let rs = std::mem::size_of::<MIB_UDPROW_OWNER_PID>();
                 for i in 0..count {
@@ -650,7 +680,7 @@ mod win_tables {
             std::ptr::null(),
         );
         if needed > 0 {
-            let mut buf = vec![0u8; needed as usize];
+            let mut buf = AlignedBuf::new(needed as usize);
             let ok = EnumServicesStatusExW(
                 mgr,
                 SC_ENUM_PROCESS_INFO,
@@ -682,7 +712,7 @@ mod win_tables {
                     let mut need2: u32 = 0;
                     QueryServiceConfigW(svc, std::ptr::null_mut(), 0, &mut need2);
                     if need2 > 0 {
-                        let mut buf2 = vec![0u8; need2 as usize];
+                        let mut buf2 = AlignedBuf::new(need2 as usize);
                         if QueryServiceConfigW(
                             svc,
                             buf2.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW,
@@ -692,8 +722,20 @@ mod win_tables {
                         {
                             let cfg = &*(buf2.as_ptr() as *const QUERY_SERVICE_CONFIGW);
                             if !cfg.lpBinaryPathName.is_null() {
+                                // Bound the NUL scan by the bytes
+                                // remaining in the buffer instead of
+                                // trusting the API contract blindly
+                                // (audit 2026-11-08).
+                                let max_units = (need2 as usize)
+                                    .saturating_sub(
+                                        cfg.lpBinaryPathName as usize
+                                            - buf2.as_ptr() as usize,
+                                    )
+                                    / 2;
                                 let mut len = 0usize;
-                                while *cfg.lpBinaryPathName.add(len) != 0 {
+                                while len < max_units
+                                    && *cfg.lpBinaryPathName.add(len) != 0
+                                {
                                     len += 1;
                                 }
                                 let raw = String::from_utf16_lossy(
@@ -918,7 +960,14 @@ mod mac_tables {
     }
 
     fn rows() -> Vec<RawRow> {
-        let Ok(out) = std::process::Command::new("lsof")
+        // Absolute paths first: a bare "lsof" would be resolved
+        // through PATH, which a planted binary could shadow (audit
+        // 2026-11-08). The bare name stays as a last resort.
+        let lsof = ["/usr/bin/lsof", "/usr/sbin/lsof", "/opt/homebrew/bin/lsof", "/usr/local/bin/lsof"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).is_file())
+            .unwrap_or("lsof");
+        let Ok(out) = std::process::Command::new(lsof)
             .args(["-nP", "-F", "pPcn", "-iTCP", "-iUDP"])
             .output()
         else {

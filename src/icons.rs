@@ -39,6 +39,18 @@ mod win {
     use windows_sys::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
 
     pub fn icon_png(exe_path: &str) -> Option<Vec<u8>> {
+        // Never resolve icons for executables on a network share:
+        // SHGetFileInfoW opens the file, which makes Windows present
+        // this (elevated) user's credentials to the share's server —
+        // SMB forced authentication (audit 2026-11-08). The `\\?\`
+        // and `\\.\` prefixes are local device paths, not shares,
+        // and local mapped drives arrive as drive letters anyway.
+        if exe_path.starts_with("\\\\")
+            && !exe_path.starts_with("\\\\?")
+            && !exe_path.starts_with("\\\\.")
+        {
+            return None;
+        }
         let wide: Vec<u16> = OsStr::new(exe_path).encode_wide().chain(Some(0)).collect();
         unsafe {
             let mut shfi: SHFILEINFOW = std::mem::zeroed();
@@ -106,7 +118,15 @@ mod win {
                     Some(buf)
                 }
             };
-            let color = read(ii.hbmColor)?;
+            // Read both bitmaps, then release the DC *before* any
+            // early return: the color read's `?` used to skip
+            // DeleteDC and leak a GDI handle per failed icon (audit
+            // 2026-11-08). The mask is only consulted for old-style
+            // icons without alpha, but reading it eagerly is cheap.
+            let color = read(ii.hbmColor);
+            let mask = read(ii.hbmMask);
+            DeleteDC(dc);
+            let color = color?;
             let mut rgba = Vec::with_capacity(color.len());
             let has_alpha = color.chunks_exact(4).any(|px| px[3] != 0);
             if has_alpha {
@@ -116,7 +136,6 @@ mod win {
             } else {
                 // Old-style icon: derive alpha from the AND mask
                 // (white = transparent).
-                let mask = read(ii.hbmMask);
                 for (i, px) in color.chunks_exact(4).enumerate() {
                     let transparent = mask
                         .as_ref()
@@ -125,7 +144,6 @@ mod win {
                     rgba.extend_from_slice(&[px[2], px[1], px[0], if transparent { 0 } else { 255 }]);
                 }
             }
-            DeleteDC(dc);
             encode_png(&rgba, w as u32, h as u32)
         })();
         if !ii.hbmColor.is_null() {

@@ -19,7 +19,7 @@ fn decrypt_captured_session() {
     let mut keys = KeyLog::new();
     keys.refresh(std::path::Path::new(&keys_p));
     assert!(keys.entries() > 0, "no keys loaded");
-    let dec = try_decrypt(&up, &down, &keys).expect("decryption failed");
+    let dec = try_decrypt(&up, &down, &mut keys).expect("decryption failed");
     let up_text = String::from_utf8_lossy(&dec.up).into_owned();
     let down_text = String::from_utf8_lossy(&dec.down).into_owned();
     println!("--- decrypted up ---\n{up_text}\n--- decrypted down (first 400) ---\n{}", &down_text[..down_text.len().min(400)]);

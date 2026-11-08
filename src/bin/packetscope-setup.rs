@@ -13,7 +13,7 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use netwatch::system_setup::{confirm_box, info_box};
+use netwatch::system_setup::{confirm_box, info_box, random_tag, system32_tool};
 use std::path::PathBuf;
 
 static PAYLOAD: &[u8] = include_bytes!("../../installer-assets/packetscope.exe");
@@ -130,24 +130,37 @@ fn install_npcap() -> Result<(), String> {
     let tmp = std::env::var_os("TEMP")
         .map(PathBuf::from)
         .ok_or("TEMP が取得できません")?;
-    let installer = tmp.join("npcap-1.90.exe");
-    let ok = std::process::Command::new("curl.exe")
+    // Unguessable file name: with a fixed name, a same-user process
+    // could pre-plant a symlink or swap the file between our
+    // signature check and the run (audit 2026-11-08). curl is spawned
+    // by absolute System32 path for the same reason — this setup
+    // binary runs elevated, and a bare "curl.exe" would be found in
+    // this executable's own folder (e.g. Downloads) first.
+    let installer = tmp.join(format!("npcap-1.90-{}.exe", random_tag()));
+    let ok = std::process::Command::new(system32_tool("curl.exe"))
         .args(["-L", "-f", "-o", &installer.to_string_lossy(), NPCAP_URL])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     log_line(&format!("npcap: download ok = {ok}"));
     if !ok {
+        let _ = std::fs::remove_file(&installer);
         return Err(
             "Npcap のダウンロードに失敗しました。https://npcap.com/ から手動でインストールしてから、PacketScope を起動してください。"
                 .into(),
         );
     }
+    // From here until the installer has run, hold the downloaded
+    // file open with read-only sharing: while this handle lives, no
+    // other process can open it for writing or replace it, so the
+    // bytes we verify are the bytes that execute.
+    let _hold = hold_file(&installer);
     // The downloaded installer runs elevated: verify its Authenticode
     // signature first, and that the signer is the expected publisher.
     let sig_ok = authenticode_ok(&installer, "Nmap");
     log_line(&format!("npcap: authenticode ok = {sig_ok}"));
     if !sig_ok {
+        drop(_hold);
         let _ = std::fs::remove_file(&installer);
         return Err(
             "ダウンロードした Npcap インストーラの署名（Authenticode）を検証できませんでした。安全のため実行を中止しました。https://npcap.com/ から手動で入手してください。"
@@ -166,15 +179,16 @@ fn install_npcap() -> Result<(), String> {
 fn register_uninstall(dir: &std::path::Path) {
     let uninstall = dir.join("uninstall.exe");
     let base = "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PacketScope";
+    let version = env!("CARGO_PKG_VERSION");
     let pairs: [(&str, &str, &str); 5] = [
         ("DisplayName", "REG_SZ", "PacketScope"),
-        ("DisplayVersion", "REG_SZ", "1.0.0"),
+        ("DisplayVersion", "REG_SZ", version),
         ("Publisher", "REG_SZ", "PacketScope"),
         ("InstallLocation", "REG_SZ", &dir.to_string_lossy()),
         ("UninstallString", "REG_SZ", &format!("\"{}\"", uninstall.to_string_lossy())),
     ];
     for (name, ty, value) in pairs {
-        let _ = std::process::Command::new("reg")
+        let _ = std::process::Command::new(system32_tool("reg.exe"))
             .args(["add", base, "/v", name, "/t", ty, "/d", value, "/f"])
             .status();
     }
@@ -331,9 +345,31 @@ mod win_shortcut {
     }
 }
 
+/// Open `path` so others may read/execute it but not write, rename
+/// or delete it while the returned handle lives (FILE_SHARE_READ).
+/// Used to pin the downloaded Npcap installer between verification
+/// and execution. Best effort: if the open fails we proceed without
+/// the pin rather than failing the install.
+#[cfg(windows)]
+fn hold_file(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1 /* FILE_SHARE_READ */)
+        .open(path)
+        .ok()
+}
+
+#[cfg(not(windows))]
+fn hold_file(_path: &std::path::Path) -> Option<std::fs::File> {
+    None
+}
+
 /// Verify an executable's Authenticode signature before running it
-/// elevated. Requires a valid signature chained to a trusted root; when
-/// the signer subject can be read, it must contain `expected_signer`.
+/// elevated. Requires a valid signature chained to a trusted root AND
+/// a signer name that can be read and contains `expected_signer` —
+/// the check fails closed when the signer cannot be identified
+/// (before the 2026-11-08 audit it silently passed in that case).
 #[cfg(windows)]
 fn authenticode_ok(path: &std::path::Path, expected_signer: &str) -> bool {
     use std::ffi::OsStr;
@@ -343,8 +379,8 @@ fn authenticode_ok(path: &std::path::Path, expected_signer: &str) -> bool {
     use windows_sys::Win32::Security::WinTrust::{
         WinVerifyTrust, WTHelperGetProvSignerFromChain, WTHelperProvDataFromStateData,
         WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO,
-        WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY,
-        WTD_UI_NONE,
+        WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOKE_WHOLECHAIN,
+        WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
     };
     let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(Some(0)).collect();
     unsafe {
@@ -354,13 +390,20 @@ fn authenticode_ok(path: &std::path::Path, expected_signer: &str) -> bool {
         let mut data: WINTRUST_DATA = std::mem::zeroed();
         data.cbStruct = std::mem::size_of::<WINTRUST_DATA>() as u32;
         data.dwUIChoice = WTD_UI_NONE;
-        data.fdwRevocationChecks = WTD_REVOKE_NONE;
+        // Revocation is checked across the whole chain, but only
+        // against cached revocation data: fetching CRLs over the
+        // network during setup would fail legitimate installs on
+        // machines whose revocation endpoints are unreachable.
+        data.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
+        data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
         data.dwUnionChoice = WTD_CHOICE_FILE;
         data.Anonymous = WINTRUST_DATA_0 { pFile: &mut file_info };
         data.dwStateAction = WTD_STATEACTION_VERIFY;
         let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
         let status = WinVerifyTrust(null_mut(), &mut action, &mut data as *mut _ as *mut _);
-        let mut signer_ok = true;
+        // Fail closed: only a signer name actually read from the
+        // certificate and matching the expectation turns this true.
+        let mut signer_ok = false;
         if status == 0 && !data.hWVTStateData.is_null() {
             let prov = WTHelperProvDataFromStateData(data.hWVTStateData);
             if !prov.is_null() {

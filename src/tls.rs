@@ -37,9 +37,30 @@ pub struct KeyLog {
     tls12: HashMap<[u8; 32], [u8; 48]>,
     /// TLS 1.3: client_random -> traffic secrets (secret bytes + length).
     tls13: HashMap<[u8; 32], Tls13Secrets>,
+    /// Insertion order of the keys, for FIFO eviction at the entry cap.
+    fifo: std::collections::VecDeque<[u8; 32]>,
+    /// Client randoms inserted since the last `take_fresh` call, so
+    /// the engine can retry decryption only for the streams whose
+    /// keys actually arrived (audit 2026-11-08).
+    fresh: Vec<[u8; 32]>,
     offset: u64,
     partial: String,
 }
+
+/// Retained key-log entries are capped: the file is attacker-influenceable
+/// in the sense that any same-user process can append to it, and an
+/// unbounded map in an always-on monitor is a memory lever (audit
+/// 2026-11-08). Real browsers produce one entry set per session; a few
+/// thousand retained sessions is far beyond a normal day's browsing.
+const MAX_KEYLOG_ENTRIES: usize = 8192;
+/// Most bytes consumed from the key log in one refresh. Legit growth
+/// between refreshes is a handful of ~200-byte lines; a bigger jump
+/// means the file is not (only) a key log, so it is skipped wholesale.
+const MAX_REFRESH_BYTES: u64 = 32 * 1024 * 1024;
+/// A key-log line is ~200 bytes. A trailing partial line longer than
+/// this is not a line at all (e.g. a newline-less blob) and is dropped
+/// instead of being buffered forever.
+const MAX_PARTIAL_LINE: usize = 8192;
 
 fn hex_bytes(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
@@ -69,8 +90,22 @@ impl KeyLog {
     }
 
     /// Incrementally read new complete lines from the key-log file.
+    ///
+    /// Hardened after the 2026-11-08 audit: only the bytes appended
+    /// since the last refresh are read (the old code re-read the whole
+    /// file every ~2 s), the amount per refresh is capped, and a
+    /// network (UNC) path is never followed — the key log is a local
+    /// file by definition, and opening a UNC path from an elevated
+    /// process would hand the server an SMB authentication attempt.
     pub fn refresh(&mut self, path: &Path) {
+        let shown = path.to_string_lossy();
+        if shown.starts_with("\\\\") && !shown.starts_with("\\\\?") && !shown.starts_with("\\\\.") {
+            return; // UNC path: not a local key log.
+        }
         let Ok(meta) = std::fs::metadata(path) else { return };
+        if !meta.is_file() {
+            return;
+        }
         if meta.len() < self.offset {
             self.offset = 0; // rotated / truncated: start over
             self.partial.clear();
@@ -78,17 +113,47 @@ impl KeyLog {
         if meta.len() == self.offset {
             return;
         }
-        let Ok(bytes) = std::fs::read(path) else { return };
-        if (bytes.len() as u64) < self.offset {
+        if meta.len() - self.offset > MAX_REFRESH_BYTES {
+            // Implausible growth for a key log: skip the blob entirely.
+            self.offset = meta.len();
+            self.partial.clear();
             return;
         }
-        let new = &bytes[self.offset as usize..];
-        self.offset = bytes.len() as u64;
-        let text = format!("{}{}", self.partial, String::from_utf8_lossy(new));
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(path) else { return };
+        if f.seek(SeekFrom::Start(self.offset)).is_err() {
+            return;
+        }
+        let mut new = Vec::new();
+        if f.read_to_end(&mut new).is_err() {
+            return;
+        }
+        self.offset += new.len() as u64;
+        let text = format!("{}{}", self.partial, String::from_utf8_lossy(&new));
         let mut lines: Vec<&str> = text.split('\n').collect();
         self.partial = lines.pop().unwrap_or("").to_string();
+        if self.partial.len() > MAX_PARTIAL_LINE {
+            self.partial.clear();
+        }
         for line in lines {
             self.parse_line(line.trim());
+        }
+    }
+
+    /// Client randoms inserted since the last call; empties the set.
+    pub fn take_fresh(&mut self) -> Vec<[u8; 32]> {
+        std::mem::take(&mut self.fresh)
+    }
+
+    /// Record a freshly inserted key for FIFO eviction and enforce
+    /// the entry cap. Call only when the key was not already present.
+    fn note_insert(&mut self, rand: [u8; 32]) {
+        self.fresh.push(rand);
+        self.fifo.push_back(rand);
+        while self.entries() > MAX_KEYLOG_ENTRIES {
+            let Some(old) = self.fifo.pop_front() else { break };
+            self.tls12.remove(&old);
+            self.tls13.remove(&old);
         }
     }
 
@@ -108,13 +173,18 @@ impl KeyLog {
         match label {
             "CLIENT_RANDOM" => {
                 if secret.len() == 48 {
+                    let fresh = !self.tls12.contains_key(&rand);
                     let mut ms = [0u8; 48];
                     ms.copy_from_slice(&secret);
                     self.tls12.insert(rand, ms);
+                    if fresh {
+                        self.note_insert(rand);
+                    }
                 }
             }
             "CLIENT_HANDSHAKE_TRAFFIC_SECRET" | "SERVER_HANDSHAKE_TRAFFIC_SECRET" => {
                 if secret.len() == 32 || secret.len() == 48 {
+                    let fresh = !self.tls13.contains_key(&rand);
                     let e = self.tls13.entry(rand).or_default();
                     let mut buf = [0u8; 48];
                     buf[..secret.len()].copy_from_slice(&secret);
@@ -124,10 +194,14 @@ impl KeyLog {
                         e.server_hs = Some(buf);
                     }
                     e.hs_len = secret.len();
+                    if fresh {
+                        self.note_insert(rand);
+                    }
                 }
             }
             "CLIENT_TRAFFIC_SECRET_0" | "SERVER_TRAFFIC_SECRET_0" => {
                 if secret.len() == 32 || secret.len() == 48 {
+                    let fresh = !self.tls13.contains_key(&rand);
                     let e = self.tls13.entry(rand).or_default();
                     let mut buf = [0u8; 48];
                     buf[..secret.len()].copy_from_slice(&secret);
@@ -137,10 +211,19 @@ impl KeyLog {
                         e.server_app = Some(buf);
                     }
                     e.app_len = secret.len();
+                    if fresh {
+                        self.note_insert(rand);
+                    }
                 }
             }
             _ => {}
         }
+    }
+
+    /// Whether any secret (TLS 1.2 or 1.3) is held for this random —
+    /// presence only, for diagnostics (v1.3.2).
+    pub fn has_any(&self, client_random: &[u8; 32]) -> bool {
+        self.tls13.contains_key(client_random) || self.tls12.contains_key(client_random)
     }
 
     fn tls13_for(&self, client_random: &[u8; 32]) -> Option<Tls13Secrets> {
@@ -150,6 +233,30 @@ impl KeyLog {
     fn master_for(&self, client_random: &[u8; 32]) -> Option<[u8; 48]> {
         self.tls12.get(client_random).copied()
     }
+
+    /// Every retained TLS 1.3 secret set, most recently inserted
+    /// first — the candidate list for trial decryption (v1.3.5).
+    fn tls13_candidates(&self) -> Vec<Tls13Secrets> {
+        self.fifo
+            .iter()
+            .rev()
+            .filter_map(|r| self.tls13.get(r).copied())
+            .collect()
+    }
+}
+
+/// How a successful decryption found its secrets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MatchKind {
+    /// The key log held secrets under the stream's own client random.
+    Direct,
+    /// The stream's client random was not in the key log — ECH was
+    /// accepted, so the browser logged the *inner* hello's random —
+    /// but a retained secret set opened the records. AEAD tag
+    /// verification makes a false hit cryptographically negligible,
+    /// and the winning set is then bound to this stream's random so
+    /// later retries take the direct path.
+    Trial,
 }
 
 // ------------------------------------------------------- stream reassembly
@@ -166,6 +273,15 @@ pub struct TcpStream {
 }
 
 const STREAM_CAP: usize = 1 << 20; // 1 MiB per direction is plenty for a preview
+/// Parked (out-of-order) segments are capped by count as well as by
+/// bytes: each parked segment costs a Vec + a BTreeMap node on top of
+/// its payload, and a peer controls how many tiny segments it sends.
+/// Past this many fragments the stream is given up on (audit
+/// 2026-11-08).
+const MAX_PENDING_SEGS: usize = 8192;
+/// Per-parked-segment overhead charged against STREAM_CAP so the byte
+/// cap bites before segment bookkeeping dominates memory.
+const SEG_OVERHEAD: usize = 64;
 
 fn seq_diff(a: u32, b: u32) -> i64 {
     a.wrapping_sub(b) as i32 as i64
@@ -199,36 +315,55 @@ impl TcpStream {
 
     fn insert(&mut self, seq: u32, data: Vec<u8>) {
         let base = self.base.unwrap();
-        let mut off = seq_diff(seq, base);
-        let mut data = data;
-        if off < 0 {
-            let cut = (-off) as usize;
-            if cut >= data.len() {
+        let mut seg = (seq, data);
+        // Iterative form of what used to be a recursive drain: a peer
+        // could park thousands of 1-byte segments behind a 1-byte gap
+        // and, by filling the gap, make the drain recurse once per
+        // parked segment until the stack overflowed and took the
+        // (elevated) monitoring process down — a remote blind spot,
+        // the worst failure for this app (audit 2026-11-08). The loop
+        // walks the same chain without growing the stack.
+        loop {
+            let (seq, mut data) = seg;
+            let mut off = seq_diff(seq, base);
+            if off < 0 {
+                let cut = (-off) as usize;
+                if cut >= data.len() {
+                    return;
+                }
+                data.drain(..cut);
+                off = 0;
+            }
+            let off = off as usize;
+            let cur = self.buf.len();
+            if off > cur {
+                // Gap: park the segment until the missing bytes arrive.
+                if self.pending.len() >= MAX_PENDING_SEGS {
+                    self.capped = true;
+                    self.pending.clear();
+                    self.pending_bytes = 0;
+                    return;
+                }
+                if !self.pending.contains_key(&seq) {
+                    self.pending_bytes += data.len() + SEG_OVERHEAD;
+                    self.pending.insert(seq, data);
+                }
                 return;
             }
-            data.drain(..cut);
-            off = 0;
-        }
-        let off = off as usize;
-        let cur = self.buf.len();
-        if off > cur {
-            // Gap: park the segment until the missing bytes arrive.
-            if !self.pending.contains_key(&seq) {
-                self.pending_bytes += data.len();
-                self.pending.insert(seq, data);
+            if off + data.len() > cur {
+                let skip = cur - off;
+                self.buf.extend_from_slice(&data[skip..]);
             }
-            return;
-        }
-        if off + data.len() > cur {
-            let skip = cur - off;
-            self.buf.extend_from_slice(&data[skip..]);
-        }
-        // Drain parked segments that are now contiguous.
-        loop {
+            // Continue with the parked segment that just became
+            // contiguous, if any, within this same call.
             let next = base.wrapping_add(self.buf.len() as u32);
-            let Some(seg) = self.pending.remove(&next) else { break };
-            self.pending_bytes -= seg.len();
-            self.insert(next, seg);
+            match self.pending.remove(&next) {
+                Some(parked) => {
+                    self.pending_bytes -= parked.len() + SEG_OVERHEAD;
+                    seg = (next, parked);
+                }
+                None => return,
+            }
         }
     }
 }
@@ -382,6 +517,12 @@ fn iter_records(stream: &[u8]) -> Vec<Record<'_>> {
         off += 5 + len;
     }
     out
+}
+
+/// The client random of the ClientHello starting a client stream,
+/// for callers that need to know which key-log entry a stream wants.
+pub fn stream_client_random(up: &[u8]) -> Option<[u8; 32]> {
+    client_random(up)
 }
 
 /// Client random from a ClientHello at the start of the client stream.
@@ -692,27 +833,95 @@ fn decrypt12_direction(
 
 /// Try to decrypt one flow's two reassembled streams. Returns the recovered
 /// application bytes per direction when at least one direction yielded data.
-pub fn try_decrypt(up: &[u8], down: &[u8], keys: &KeyLog) -> Option<Decrypted> {
-    let crand = client_random(up)?;
-    let sh = server_hello(down)?;
+pub fn try_decrypt(up: &[u8], down: &[u8], keys: &mut KeyLog) -> Option<Decrypted> {
+    try_decrypt_stage(up, down, keys).1
+}
+
+/// Like `try_decrypt`, but also reports how far it got, as a short
+/// stage tag. The engine records these in decrypt.log: "the key for
+/// this flow never arrived" and "the key was there but AEAD yielded
+/// nothing" are very different bugs, and from the UI alone they look
+/// identical (field report, v1.2.11). Secret values are never part
+/// of the report — presence/absence only.
+pub fn try_decrypt_stage(
+    up: &[u8],
+    down: &[u8],
+    keys: &mut KeyLog,
+) -> (&'static str, Option<Decrypted>) {
+    try_decrypt_match(up, down, keys).1
+}
+
+/// `try_decrypt_stage` plus, on success, how the secrets were found
+/// (`MatchKind`). On a TLS 1.3 random miss, falls back to trial
+/// decryption over the retained secret sets (v1.3.5): with ECH
+/// accepted, Chromium logs the inner ClientHello's random, so the
+/// outer random on the wire is never in the key log — but the logged
+/// traffic secrets themselves open the records, because TLS 1.3
+/// derives the record keys from the stored traffic secrets directly
+/// and never re-consults the random. A candidate wins only when an
+/// AEAD tag verifies, so a wrong candidate cannot produce output.
+pub fn try_decrypt_match(
+    up: &[u8],
+    down: &[u8],
+    keys: &mut KeyLog,
+) -> (Option<MatchKind>, (&'static str, Option<Decrypted>)) {
+    let Some(crand) = client_random(up) else {
+        return (None, ("no-client-random", None));
+    };
+    let Some(sh) = server_hello(down) else {
+        return (None, ("no-server-hello", None));
+    };
     let up_records = iter_records(up);
     let down_records = iter_records(down);
     if up_records.is_empty() || down_records.is_empty() {
-        return None;
+        return (None, ("no-complete-records", None));
     }
     if sh.tls13 {
-        let (kind, hash) = suite13(sh.cipher)?;
-        let secrets = keys.tls13_for(&crand)?;
-        let up_plain = decrypt13_direction(&up_records, true, kind, hash, &secrets);
-        let down_plain = decrypt13_direction(&down_records, false, kind, hash, &secrets);
-        if up_plain.is_empty() && down_plain.is_empty() {
-            return None;
+        let Some((kind, hash)) = suite13(sh.cipher) else {
+            return (None, ("tls13-unknown-suite", None));
+        };
+        if let Some(secrets) = keys.tls13_for(&crand) {
+            let up_plain = decrypt13_direction(&up_records, true, kind, hash, &secrets);
+            let down_plain = decrypt13_direction(&down_records, false, kind, hash, &secrets);
+            if up_plain.is_empty() && down_plain.is_empty() {
+                // The direct set has the random but opens nothing;
+                // trialling other sets cannot fix a wrong-secret
+                // case and would only burn time.
+                return (None, ("tls13-secret-found-aead-empty", None));
+            }
+            return (Some(MatchKind::Direct), ("ok", Some(Decrypted { up: up_plain, down: down_plain })));
         }
-        return Some(Decrypted { up: up_plain, down: down_plain });
+        // Random miss: trial-decrypt with the retained sets, newest
+        // first. The handshake phase decides cheaply — a wrong set
+        // fails its first AEAD open in each direction and is dropped;
+        // cap the work per attempt (a day's browsing can leave
+        // thousands of sets, and this runs per undecrypted stream).
+        const MAX_TRIAL: usize = 256;
+        let candidates = keys.tls13_candidates();
+        for secrets in candidates.iter().take(MAX_TRIAL) {
+            let up_plain = decrypt13_direction(&up_records, true, kind, hash, secrets);
+            let down_plain = decrypt13_direction(&down_records, false, kind, hash, secrets);
+            if up_plain.is_empty() && down_plain.is_empty() {
+                continue;
+            }
+            // Bind the winning set to this stream's random: later
+            // retries (and the keyed= diagnostic) take the direct
+            // path from here on.
+            keys.tls13.insert(crand, *secrets);
+            return (
+                Some(MatchKind::Trial),
+                ("ok-trial", Some(Decrypted { up: up_plain, down: down_plain })),
+            );
+        }
+        return (None, ("tls13-no-secret-for-random", None));
     }
     // TLS 1.2 (or older): CLIENT_RANDOM -> master secret.
-    let (kind, hash) = suite12(sh.cipher)?;
-    let master = keys.master_for(&crand)?;
+    let Some((kind, hash)) = suite12(sh.cipher) else {
+        return (None, ("tls12-unknown-suite", None));
+    };
+    let Some(master) = keys.master_for(&crand) else {
+        return (None, ("tls12-no-master-secret", None));
+    };
     let mut seed = Vec::with_capacity(64);
     seed.extend_from_slice(&sh.random);
     seed.extend_from_slice(&crand);
@@ -730,7 +939,183 @@ pub fn try_decrypt(up: &[u8], down: &[u8], keys: &KeyLog) -> Option<Decrypted> {
         down_plain = decrypt12_direction(&down_records, false, kind, &key_block, false);
     }
     if up_plain.is_empty() && down_plain.is_empty() {
-        return None;
+        return (None, ("tls12-aead-empty", None));
     }
-    Some(Decrypted { up: up_plain, down: down_plain })
+    (Some(MatchKind::Direct), ("ok", Some(Decrypted { up: up_plain, down: down_plain })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- helpers to build a synthetic TLS 1.3 session
+    fn record(rtype: u8, frag: &[u8]) -> Vec<u8> {
+        let mut v = vec![rtype, 0x03, 0x03];
+        v.extend_from_slice(&(frag.len() as u16).to_be_bytes());
+        v.extend_from_slice(frag);
+        v
+    }
+    fn handshake_msg(t: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![t, (body.len() >> 16) as u8, (body.len() >> 8) as u8, body.len() as u8];
+        v.extend_from_slice(body);
+        v
+    }
+    fn client_hello(random: &[u8; 32]) -> Vec<u8> {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(random);
+        body.extend_from_slice(&[0]); // session id: empty
+        body.extend_from_slice(&[0, 2, 0x13, 0x01]); // cipher suites: TLS_AES_128_GCM_SHA256
+        body.extend_from_slice(&[1, 0]); // compression: null
+        body.extend_from_slice(&[0, 0]); // extensions: none
+        record(22, &handshake_msg(1, &body))
+    }
+    fn server_hello(random: &[u8; 32]) -> Vec<u8> {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(random);
+        body.extend_from_slice(&[0]); // session id: empty
+        body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        body.extend_from_slice(&[0]); // compression: null
+        // extensions block (len 6): supported_versions = TLS 1.3
+        body.extend_from_slice(&[0, 6, 0, 43, 0, 2, 0x03, 0x04]);
+        record(22, &handshake_msg(2, &body))
+    }
+    fn seal_record(kind: AeadKind, secret: &[u8; 48], slen: usize, seq: u64, inner: &[u8], itype: u8) -> Vec<u8> {
+        let hash = HashKind::Sha256;
+        let key = expand_label(hash, &secret[..slen], "key", kind.key_len());
+        let iv = expand_label(hash, &secret[..slen], "iv", 12);
+        let mut plain = inner.to_vec();
+        plain.push(itype);
+        let frag_len = plain.len() + 16;
+        let mut aad = vec![0x17, 0x03, 0x03];
+        aad.extend_from_slice(&(frag_len as u16).to_be_bytes());
+        let mut ivb = [0u8; 12];
+        ivb.copy_from_slice(&iv);
+        let nonce = xor_seq(&ivb, seq);
+        let payload = aes_gcm::aead::Payload { msg: &plain, aad: &aad };
+        let ct = match kind {
+            AeadKind::Aes128Gcm => Aes128Gcm::new_from_slice(&key)
+                .unwrap()
+                .encrypt(aes_gcm::Nonce::from_slice(&nonce), payload)
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        record(23, &ct)
+    }
+
+    /// Build a full synthetic session for the given logged random:
+    /// ClientHello, ServerHello, encrypted server Finished, one app
+    /// record each way. Returns (up, down, secrets).
+    fn synth_session(logged_random: &[u8; 32]) -> (Vec<u8>, Vec<u8>, Tls13Secrets) {
+        let crand = *logged_random;
+        let srand = [0x77u8; 32];
+        let secrets = Tls13Secrets {
+            client_hs: Some([0x11; 48]),
+            server_hs: Some([0x22; 48]),
+            client_app: Some([0x33; 48]),
+            server_app: Some([0x44; 48]),
+            hs_len: 32,
+            app_len: 32,
+        };
+        let finished = handshake_msg(20, &[0xAB; 32]);
+        let down = [
+            server_hello(&srand),
+            seal_record(AeadKind::Aes128Gcm, &secrets.server_hs.unwrap(), 32, 0, &finished, 22),
+            seal_record(AeadKind::Aes128Gcm, &secrets.server_app.unwrap(), 32, 0, b"hello down", 23),
+        ]
+        .concat();
+        // A real client's first application record precedes its
+        // Finished in flight order only on the wire timeline; in the
+        // reassembled up-stream the client Finished (handshake keys,
+        // seq 0) comes before application data (app keys, seq 0),
+        // which is what decrypt13_direction's phase machine expects.
+        let cfinished = handshake_msg(20, &[0xCD; 32]);
+        let up = [
+            client_hello(&crand),
+            seal_record(AeadKind::Aes128Gcm, &secrets.client_hs.unwrap(), 32, 0, &cfinished, 22),
+            seal_record(AeadKind::Aes128Gcm, &secrets.client_app.unwrap(), 32, 0, b"hello up", 23),
+        ]
+        .concat();
+        (up, down, secrets)
+    }
+
+    fn keylog_with(random: &[u8; 32], s: &Tls13Secrets) -> KeyLog {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let r = hex(random);
+        let text = format!(
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET {r} {}\nSERVER_HANDSHAKE_TRAFFIC_SECRET {r} {}\nCLIENT_TRAFFIC_SECRET_0 {r} {}\nSERVER_TRAFFIC_SECRET_0 {r} {}\n",
+            hex(&s.client_hs.unwrap()[..32]),
+            hex(&s.server_hs.unwrap()[..32]),
+            hex(&s.client_app.unwrap()[..32]),
+            hex(&s.server_app.unwrap()[..32]),
+        );
+        let path = std::env::temp_dir().join(format!(
+            "pk-test-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, text).unwrap();
+        let mut kl = KeyLog::new();
+        kl.refresh(&path);
+        let _ = std::fs::remove_file(&path);
+        kl
+    }
+
+    #[test]
+    fn direct_match_by_random() {
+        let (up, down, secrets) = synth_session(&[0x42; 32]);
+        let mut kl = keylog_with(&[0x42; 32], &secrets);
+        let (m, (stage, dec)) = try_decrypt_match(&up, &down, &mut kl);
+        assert_eq!(m, Some(MatchKind::Direct));
+        assert_eq!(stage, "ok");
+        let dec = dec.expect("decrypted");
+        assert_eq!(dec.up, b"hello up");
+        assert_eq!(dec.down, b"hello down");
+    }
+
+    /// The ECH case (field logs, Nov 2026): the wire ClientHello
+    /// carries the OUTER random; the key log holds the secrets under
+    /// the INNER random. Trial decryption must recover the session
+    /// and bind the set to the outer random.
+    #[test]
+    fn trial_match_when_random_differs() {
+        let inner = [0x99u8; 32];
+        let (mut up, down, secrets) = synth_session(&inner);
+        // Rewrite the ClientHello random to the "outer" one.
+        let outer = [0x55u8; 32];
+        let pos = up.windows(32).position(|w| w == inner).unwrap();
+        up[pos..pos + 32].copy_from_slice(&outer);
+        let mut kl = keylog_with(&inner, &secrets);
+        let (m, (stage, dec)) = try_decrypt_match(&up, &down, &mut kl);
+        assert_eq!(kl.tls13_candidates().len(), 1, "candidates: key log must hold the set");
+        assert_eq!(m, Some(MatchKind::Trial), "stage was {stage}");
+        assert_eq!(stage, "ok-trial");
+        let dec = dec.expect("decrypted by trial");
+        assert_eq!(dec.up, b"hello up");
+        assert_eq!(dec.down, b"hello down");
+        // Bound now: the direct path finds it too.
+        assert!(kl.tls13_for(&outer).is_some());
+    }
+
+    /// A key log full of unrelated sessions must not yield output.
+    #[test]
+    fn trial_no_false_positive() {
+        let (up, down, _secrets) = synth_session(&[0x42; 32]);
+        let other = Tls13Secrets {
+            client_hs: Some([0x91; 48]),
+            server_hs: Some([0x92; 48]),
+            client_app: Some([0x93; 48]),
+            server_app: Some([0x94; 48]),
+            hs_len: 32,
+            app_len: 32,
+        };
+        let mut kl = keylog_with(&[0x24; 32], &other);
+        let (m, (stage, dec)) = try_decrypt_match(&up, &down, &mut kl);
+        assert_eq!(m, None);
+        assert_eq!(stage, "tls13-no-secret-for-random");
+        assert!(dec.is_none());
+    }
+}
+

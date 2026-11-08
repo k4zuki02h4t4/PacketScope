@@ -39,6 +39,22 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=app.manifest");
     println!("cargo:rerun-if-changed=assets/app.ico");
+    // Delay-load Npcap's wpcap.dll in the main binary: it must NOT be
+    // mapped into the process at startup. This one binary also runs
+    // as uninstall.exe and as the cleanup helper, and with a load-time
+    // import the loader maps wpcap.dll into those processes too —
+    // whereupon Npcap's own uninstaller lists "uninstall.exe" as a
+    // program using Npcap resources, and choosing OK in its dialog
+    // ("close the program manually or it will be forcibly closed")
+    // kills our uninstaller in the middle of the Npcap wait, so the
+    // completion dialog and the folder cleanup never run (field logs
+    // + screen recording, 2026-11-08). Delay-loaded, the DLL only
+    // loads on the first real pcap call, which only the capture path
+    // of the main app ever makes. The setup binary does not import
+    // wpcap at all (it references no pcap symbols), so the flag is
+    // scoped to the packetscope bin.
+    println!("cargo:rustc-link-arg-bin=packetscope=/DELAYLOAD:wpcap.dll");
+    println!("cargo:rustc-link-lib=delayimp");
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let manifest = format!("{manifest_dir}/app.manifest");
     let icon = format!("{manifest_dir}/assets/app.ico");

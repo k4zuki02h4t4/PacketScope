@@ -3,7 +3,10 @@
 
 use crate::attrib::{Resolver, TableResolver};
 use crate::model::*;
-use crate::parse::{classify, classify_decrypted, is_client_hello, parse_frame, tls_server_version};
+use crate::parse::{
+    classify, classify_decrypted, client_hello_has_ech, is_client_hello, parse_frame,
+    sanitize_display, tls_server_version,
+};
 use crate::tls::{KeyLog, TcpStream};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
@@ -40,11 +43,37 @@ pub struct Engine {
     /// Reassembled streams for TLS flows (kept engine-side: snapshots stay
     /// light) plus the sizes/keys state at the last decryption attempt.
     tls_streams: HashMap<FlowKey, (TcpStream, TcpStream, (usize, usize, usize))>,
+    /// Total reassembled bytes across `tls_streams` as of the last
+    /// tick's prune, used to gate new stream creation.
+    tls_bytes_cached: usize,
+    /// Remaining line budget for decrypt.log in this run.
+    decrypt_log_left: usize,
+    /// False until the first key-log sweep has run. That first sweep
+    /// must attempt *every* retained stream, not just the ones whose
+    /// bytes changed during this run: streams whose handshakes were
+    /// captured before the first sweep and then went quiet (a single
+    /// burst, a keep-alive connection) otherwise never satisfy the
+    /// "sizes changed / its key arrived" gate — their keys were read
+    /// in bulk at the first refresh, before any of them was tracked
+    /// as fresh (field finding, v1.2.12: 103 streams attempted of
+    /// which only the still-growing ones ever got a try, 5/6 possible
+    /// decryptions landed).
+    swept_once: bool,
     keylog: KeyLog,
     last_keylog_check: SystemTime,
     last_resolve: SystemTime,
     max_flows: usize,
 }
+
+/// Cap on the reassembled-byte total kept for TLS decryption across
+/// all flows (per-direction parked bytes are bounded separately by
+/// the per-stream cap in tls.rs).
+pub const MAX_TLS_STREAM_BYTES: usize = 128 * 1024 * 1024;
+/// Cap on frame bytes waiting in the capture -> engine queue. The
+/// queue was already bounded to 8192 frames; at the 64 KiB snaplen
+/// that still allowed ~512 MiB of backlog (audit 2026-11-08), so the
+/// budget is in bytes as well.
+pub const MAX_QUEUED_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 pub enum EngineEvent {
     /// A captured frame plus its pcap datalink type.
@@ -60,6 +89,25 @@ pub enum EngineEvent {
 
 impl Engine {
     pub fn new(settings: Settings) -> Self {
+        // Start this run's decryption diagnostics log. It records
+        // the key-log state and how far each decryption attempt got
+        // (stage tags only — never secret material), because "not
+        // decrypted" has several very different possible causes and
+        // they are indistinguishable from the UI (field report,
+        // v1.2.11).
+        {
+            let kl = keylog_path(&settings);
+            let _ = std::fs::create_dir_all(data_dir());
+            let _ = std::fs::write(
+                data_dir().join("decrypt.log"),
+                format!(
+                    "PacketScope v{} decrypt diagnostics\nkeylog path: {}\nkeylog size at start: {}\n",
+                    env!("CARGO_PKG_VERSION"),
+                    kl.display(),
+                    std::fs::metadata(&kl).map(|m| m.len()).unwrap_or(0),
+                ),
+            );
+        }
         Engine {
             flows: HashMap::new(),
             order: VecDeque::new(),
@@ -81,6 +129,9 @@ impl Engine {
             seen_destinations: HashSet::new(),
             upload_windows: HashMap::new(),
             tls_streams: HashMap::new(),
+            tls_bytes_cached: 0,
+            decrypt_log_left: 400,
+            swept_once: false,
             keylog: KeyLog::new(),
             last_keylog_check: SystemTime::UNIX_EPOCH,
             last_resolve: SystemTime::UNIX_EPOCH,
@@ -131,6 +182,7 @@ impl Engine {
             if is_new && self.flows.len() >= self.max_flows {
                 if let Some(old) = self.order.pop_front() {
                     self.flows.remove(&old);
+                    self.tls_streams.remove(&old);
                 }
             }
             let flow = self
@@ -175,6 +227,7 @@ impl Engine {
     }
 
     fn on_tick(&mut self) {
+        self.prune_tls_streams();
         self.try_keylog_decrypt();
         if self.last_resolve.elapsed().unwrap_or_default() > Duration::from_millis(300) {
             self.resolver.refresh();
@@ -369,6 +422,7 @@ impl Engine {
             }
         }
         // Keep the reassembled streams of TLS flows for key-log decryption.
+        let mut stream_log: Option<String> = None;
         if p.proto == Proto::Tcp {
             let has_stream = self.tls_streams.contains_key(&key);
             if has_stream {
@@ -379,10 +433,36 @@ impl Engine {
                         down_s.push(p.seq.unwrap_or(0), &p.payload);
                     }
                 }
-            } else if upload && is_client_hello(&p.payload) && self.tls_streams.len() < 2000 {
+            } else if upload
+                && is_client_hello(&p.payload)
+                && self.tls_streams.len() < 2000
+                && self.tls_bytes_cached <= MAX_TLS_STREAM_BYTES
+            {
                 let mut up_s = TcpStream::new();
                 up_s.push(p.seq.unwrap_or(0), &p.payload);
                 self.tls_streams.insert(key.clone(), (up_s, TcpStream::new(), (0, 0, 0)));
+                // v1.3.2 diagnostics: record whether this ClientHello
+                // carries ECH (its keys then never reach the key log)
+                // and which process the flow belongs to, so a field
+                // log alone can split "browser population mismatch"
+                // from "ECH" from "other apps". v1.3.3 adds the pid
+                // and the local port: two brave.exe process trees
+                // (one launched with the key-log environment, one
+                // without) are indistinguishable by name alone, and
+                // the field data (v1.3.2 run, AdGuard off) showed a
+                // per-destination split — Meta/muse.ai keyed=false
+                // with ech=false, most others keyed — that only a
+                // per-process split can explain or refute.
+                stream_log = Some(format!(
+                    "stream start: {}:{} lport={} proc={} pid={} ech={} ({} streams tracked)",
+                    key.remote_ip,
+                    key.remote_port,
+                    key.local_port,
+                    if flow.process_name.is_empty() { "?" } else { flow.process_name.as_str() },
+                    flow.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()),
+                    client_hello_has_ech(&p.payload),
+                    self.tls_streams.len()
+                ));
             }
         }
         // TLS version from the ServerHello when one passes by.
@@ -391,17 +471,29 @@ impl Engine {
         } else if flow.tls_version.is_none() && is_client_hello(&p.payload) {
             flow.tls_version = Some("TLS".to_string());
         }
-        // host name hints
+        // With ECH the SNI is only the cover (public) name; the real
+        // destination arrives later, from inside the decrypted
+        // stream. Mark such flows so the UI does not present the
+        // cover name as the destination (v1.3.1, field finding:
+        // injections.adguard.org flows are ECH-fronted, which is
+        // also why their ClientHello randoms never appear in the
+        // browser key log — ECH inner handshakes are not logged).
+        if upload && flow.host_from_tls.is_none() && client_hello_has_ech(&p.payload) {
+            flow.host_from_tls = Some(String::new()); // marker: ECH, name unknown
+        }
+        // Host name hints. Both sources are peer-controlled bytes, so
+        // the value is sanitized once, here at assignment, instead of
+        // relying on every display site to clean it (audit 2026-11-08).
         match (&flow.content_up, &flow.content_down) {
             (Content::TlsHello { server_name: Some(s) }, _) |
             (_, Content::TlsHello { server_name: Some(s) }) => {
                 if flow.remote_host.is_none() {
-                    flow.remote_host = Some(s.clone());
+                    flow.remote_host = Some(sanitize_display(s));
                 }
             }
             (Content::Dns { names }, _) | (_, Content::Dns { names }) => {
                 if flow.remote_host.is_none() {
-                    flow.remote_host = names.first().cloned();
+                    flow.remote_host = names.first().map(|n| sanitize_display(n));
                 }
             }
             _ => {}
@@ -423,8 +515,47 @@ impl Engine {
             self.order.push_back(key.clone());
         }
         drop(flow);
+        if let Some(m) = stream_log {
+            self.decrypt_log(&m);
+        }
         if !pname.is_empty() && !self.settings.is_excluded(&pname, &ppath) {
             self.alert_checks(&pname, &host_label, upload, len, now);
+        }
+    }
+
+    /// Bound the total memory held by reassembled TLS streams. The
+    /// per-stream cap and the stream-count cap alone allowed a
+    /// theoretical 2000 flows × 2 directions × ~1 MiB ≈ 4 GiB, and
+    /// streams of long-finished flows were never reaped (audit
+    /// 2026-11-08). Oldest flows lose their streams first; the flows
+    /// themselves stay, only decryption/preview data goes.
+    fn prune_tls_streams(&mut self) {
+        let mut total: usize =
+            self.tls_streams.values().map(|(u, d, _)| u.len() + d.len()).sum();
+        if total > MAX_TLS_STREAM_BYTES {
+            let order: Vec<FlowKey> = self.order.iter().cloned().collect();
+            for k in order {
+                if total <= MAX_TLS_STREAM_BYTES * 3 / 4 {
+                    break;
+                }
+                if let Some((u, d, _)) = self.tls_streams.remove(&k) {
+                    total -= u.len() + d.len();
+                }
+            }
+        }
+        self.tls_bytes_cached = total;
+    }
+
+    /// Append one line to decrypt.log (budget-capped per run).
+    fn decrypt_log(&mut self, msg: &str) {
+        if self.decrypt_log_left == 0 {
+            return;
+        }
+        self.decrypt_log_left -= 1;
+        use std::io::Write;
+        let path = data_dir().join("decrypt.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{msg}");
         }
     }
 
@@ -433,12 +564,29 @@ impl Engine {
     fn try_keylog_decrypt(&mut self) {
         if self.last_keylog_check.elapsed().unwrap_or_default() > Duration::from_secs(2) {
             self.last_keylog_check = SystemTime::now();
-            self.keylog.refresh(&keylog_path(&self.settings));
+            let before = self.keylog.entries();
+            let path = keylog_path(&self.settings);
+            self.keylog.refresh(&path);
+            let after = self.keylog.entries();
+            if after != before {
+                self.decrypt_log(&format!(
+                    "keylog: entries {before} -> {after} (file size {})",
+                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+                ));
+            }
         }
         if self.keylog.entries() == 0 {
             return;
         }
+        let first_sweep = !self.swept_once;
+        self.swept_once = true;
         let entries = self.keylog.entries();
+        // Retry an undecrypted stream only when its own bytes grew or
+        // when *its* key arrived since the last attempt. The old rule
+        // (any key-log growth retries every stream) made each line a
+        // busy browser appended re-clone and re-scan all retained
+        // streams (audit 2026-11-08).
+        let fresh: HashSet<[u8; 32]> = self.keylog.take_fresh().into_iter().collect();
         let keys: Vec<FlowKey> = self.tls_streams.keys().cloned().collect();
         for k in keys {
             let already = self.flows.get(&k).map(|f| f.tls_decrypted).unwrap_or(false);
@@ -448,24 +596,90 @@ impl Engine {
             let Some((up_s, down_s, seen)) = self.tls_streams.get_mut(&k) else {
                 continue;
             };
+            let sizes_changed = (seen.0, seen.1) != (up_s.len(), down_s.len());
+            let key_arrived = crate::tls::stream_client_random(up_s.bytes())
+                .map(|cr| fresh.contains(&cr))
+                .unwrap_or(false);
+            // Any key-log growth since this stream's last attempt
+            // also earns one retry (v1.3.5): a quiet stream whose key
+            // lands late — short API calls regularly finish before
+            // the browser's key-log write is picked up — was never
+            // retried under the per-random rule when the arriving
+            // random did not match its own (the ECH inner/outer
+            // split), and trial decryption can now use keys that
+            // arrived under a *different* random. Cost is bounded:
+            // one attempt per stream per growth batch.
+            let keylog_grew = seen.2 != entries;
             let state = (up_s.len(), down_s.len(), entries);
-            if *seen == state || up_s.len() == 0 || down_s.len() == 0 {
+            if (!first_sweep && !sizes_changed && !key_arrived && !keylog_grew)
+                || up_s.len() == 0
+                || down_s.len() == 0
+            {
                 continue;
             }
             *seen = state;
             let up = up_s.bytes().to_vec();
             let down = down_s.bytes().to_vec();
-            let Some(dec) = crate::tls::try_decrypt(&up, &down, &self.keylog) else {
+            drop((up_s, down_s));
+            let (match_kind, (stage, dec)) =
+                crate::tls::try_decrypt_match(&up, &down, &mut self.keylog);
+            let crand = crand_tag(&up);
+            let Some(dec) = dec else {
+                // v1.3.2 diagnostics: append the owning process and
+                // whether the key log holds anything for this random
+                // at attempt time — the two facts that decide between
+                // "not the key-logging browser", "ECH" and a bug here.
+                // v1.3.3 adds pid + local port for the per-process
+                // split described at stream start.
+                let (proc_name, keyed) = (
+                    self.flows
+                        .get(&k)
+                        .map(|f| {
+                            let name = if f.process_name.is_empty() {
+                                "?".to_string()
+                            } else {
+                                f.process_name.clone()
+                            };
+                            let pid = f
+                                .pid
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "?".to_string());
+                            format!("{name}#{pid}")
+                        })
+                        .unwrap_or_else(|| "?#?".to_string()),
+                    crate::tls::stream_client_random(&up)
+                        .map(|cr| self.keylog.has_any(&cr))
+                        .unwrap_or(false),
+                );
+                self.decrypt_log(&format!(
+                    "attempt {}:{} lport={} crand={} up={}B down={}B proc={} keyed={} -> {stage}",
+                    k.remote_ip, k.remote_port, k.local_port, crand, up.len(), down.len(), proc_name, keyed
+                ));
                 continue;
             };
+            self.decrypt_log(&format!(
+                "attempt {}:{} lport={} crand={} -> ok{} (up {}B, down {}B plaintext)",
+                k.remote_ip,
+                k.remote_port,
+                k.local_port,
+                crand,
+                if match_kind == Some(crate::tls::MatchKind::Trial) { "-trial" } else { "" },
+                dec.up.len(),
+                dec.down.len()
+            ));
             if let Some(flow) = self.flows.get_mut(&k) {
                 flow.tls_decrypted = true;
                 if !dec.up.is_empty() {
-                    flow.content_up = classify_decrypted(&dec.up);
+                    flow.content_up = classify_decrypted(&dec.up, true);
+                    if let Some(a) = crate::http2::first_authority(&dec.up)
+                        .or_else(|| crate::parse::http1_host(&dec.up))
+                    {
+                        flow.host_from_tls = Some(sanitize_display(&a));
+                    }
                     flow.plain_up = dec.up;
                 }
                 if !dec.down.is_empty() {
-                    flow.content_down = classify_decrypted(&dec.down);
+                    flow.content_down = classify_decrypted(&dec.down, false);
                     flow.plain_down = dec.down;
                 }
             }
@@ -553,6 +767,17 @@ impl Engine {
     }
 }
 
+/// Short tag of a client stream's ClientHello random (first 8 bytes
+/// in hex) for the diagnostics log. The random itself travels in
+/// cleartext in every ClientHello, so logging its prefix is not a
+/// secret leak; it is what links a flow to its key-log entry.
+fn crand_tag(up: &[u8]) -> String {
+    match crate::tls::stream_client_random(up) {
+        Some(cr) => cr[..8].iter().map(|b| format!("{b:02x}")).collect(),
+        None => "none".to_string(),
+    }
+}
+
 /// Where the browser key log lives: settings override, else
 /// `sslkeylog.log` in the same data directory as settings.txt.
 pub fn keylog_path(settings: &Settings) -> std::path::PathBuf {
@@ -618,6 +843,11 @@ pub fn spawn(
     settings: Settings,
 ) -> std::sync::mpsc::Receiver<(Vec<Flow>, Vec<Alert>, String)> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<EngineEvent>(8192);
+    // Frame bytes currently queued, shared between the capture
+    // threads (add on enqueue) and the engine thread (subtract on
+    // dequeue) to enforce MAX_QUEUED_FRAME_BYTES.
+    let queued_frame_bytes =
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (snap_tx, snap_rx) = std::sync::mpsc::channel();
     {
         let tx_tick = tx.clone();
@@ -631,7 +861,8 @@ pub fn spawn(
     #[cfg(feature = "npcap")]
     {
         let tx_cap = tx.clone();
-        std::thread::spawn(move || crate::capture::run_pcap(tx_cap));
+        let queued_cap = queued_frame_bytes.clone();
+        std::thread::spawn(move || crate::capture::run_pcap(tx_cap, queued_cap));
     }
     // ETW process-start feed (Windows): names processes too
     // short-lived for the connection tables. Silently absent when the
@@ -662,7 +893,11 @@ pub fn spawn(
         let mut last_snap = SystemTime::now();
         for ev in rx {
             match ev {
-                EngineEvent::Frame(f, lt) => engine.on_frame(&f, lt),
+                EngineEvent::Frame(f, lt) => {
+                    queued_frame_bytes
+                        .fetch_sub(f.len(), std::sync::atomic::Ordering::Relaxed);
+                    engine.on_frame(&f, lt)
+                }
                 EngineEvent::Sightings(rows) => engine.on_sightings(rows),
                 EngineEvent::CaptureStatus(s) => engine.capture_status = s,
                 EngineEvent::ProcStart(p) => engine.proc_feed.push(p),
